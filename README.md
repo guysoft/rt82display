@@ -56,6 +56,16 @@ rt82display list
 rt82display info
 ```
 
+## Example
+
+A test GIF is included in the repository to verify your setup works:
+
+```bash
+rt82display upload capture_test.gif
+```
+
+![Example GIF](capture_test.gif)
+
 ## Limitations
 
 - **64KB file size limit**: The RT82 firmware has a ~64KB buffer. Complex GIFs with many color transitions may exceed this limit and cause display artifacts.
