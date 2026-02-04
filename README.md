@@ -4,12 +4,33 @@ Upload GIFs to your Epomaker RT82 keyboard's LCD screen from the command line.
 
 ## Installation
 
+### 1. Install Python package
+
 ```bash
 cd rt82display
 uv pip install -e .
 ```
 
+### 2. Build the native QGIF encoder
+
+The QGIF encoder is compiled from WebAssembly (the same code as the official web tool):
+
+```bash
+cd wasm2c_runtime
+./build.sh
+```
+
+**Requirements:**
+- C compiler (gcc/clang)
+- WABT runtime headers (included in `wasm2c_runtime/`)
+
 ## Usage
+
+### Upload a GIF (auto-encodes to QGIF)
+
+```bash
+rt82display upload my_animation.gif
+```
 
 ### Upload a pre-encoded QGIF file
 
@@ -17,44 +38,58 @@ uv pip install -e .
 rt82display upload my_animation.qgif
 ```
 
-### Current Workflow (Encoding via Web Tool)
+### Encode a GIF without uploading
 
-Until native encoding is fully working, use the web tool to encode GIFs:
+```bash
+rt82display encode input.gif output.qgif
+```
 
-1. **Open** https://image.rdmctmzt.com/ in Chrome
+### List connected devices
 
-2. **Paste this capture script** in DevTools Console (F12):
+```bash
+rt82display list
+```
+
+### Show device/protocol info
+
+```bash
+rt82display info
+```
+
+## Limitations
+
+- **64KB file size limit**: The RT82 firmware has a ~64KB buffer. Complex GIFs with many color transitions may exceed this limit and cause display artifacts.
+- **Best results**: Use simple GIFs with solid colors and minimal patterns.
+- If your GIF exceeds the limit, you'll see a warning but can still attempt the upload.
+
+## Alternative: Web Tool Encoding
+
+If the native encoder doesn't work for your GIF, you can capture QGIF from the official web tool:
+
+1. Open https://image.rdmctmzt.com/ in Chrome
+2. Paste this in DevTools Console (F12):
 ```javascript
 window._p=[];const _s=HIDDevice.prototype.sendReport;HIDDevice.prototype.sendReport=function(i,d){window._p.push(Array.from(new Uint8Array(d)));return _s.call(this,i,d)};window.dl=()=>{const c=[];window._p.filter(x=>x[1]===0x19).forEach(x=>c.push(...x.slice(8)));if(!c.length){console.log('No data!');return}const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([new Uint8Array(c)]));a.download='animation.qgif';a.click();console.log('Saved',c.length,'bytes')};console.log('Ready! Upload GIF, Download to Device, then run: dl()');
 ```
-
-3. **Upload your GIF** to the web tool
-
-4. **Click "Download to Device"** (wait for completion)
-
-5. **Run `dl()`** in console to save the QGIF file
-
-6. **Upload via CLI**:
-```bash
-rt82display upload ~/Downloads/animation.qgif
-```
-
-## Commands
-
-- `rt82display list` - List connected devices
-- `rt82display info` - Show device info  
-- `rt82display upload <file.qgif>` - Upload QGIF to display
+3. Upload your GIF and click "Download to Device"
+4. Run `dl()` in console to save the QGIF file
+5. Upload via CLI: `rt82display upload animation.qgif`
 
 ## Technical Details
 
-- Display: 240×135 RGB565
-- Format: Proprietary QGIF (compressed)
-- Protocol: USB HID with two-stage device activation
+- **Display**: 240×135 RGB565
+- **Format**: Proprietary QGIF (RLE compressed)
+- **Protocol**: USB HID with two-stage device activation
+- **Encoder**: wasm2c-compiled from official qgif.wasm
 
 See [PROTOCOL.md](PROTOCOL.md) and [QGIF.md](QGIF.md) for technical documentation.
 
-## Status
+## Troubleshooting
 
-- ✅ Upload protocol fully working
-- ⚠️ Native QGIF encoding in progress (use web tool for now)
-- ✅ Device detection and connection
+See [AGENTS.md](AGENTS.md) for detailed troubleshooting steps.
+
+### Quick fixes:
+
+- **Device not found**: Unplug and replug keyboard
+- **Screen stuck on "Downloading"**: Unplug and replug
+- **Garbled display**: GIF likely exceeds 64KB limit, try simpler patterns

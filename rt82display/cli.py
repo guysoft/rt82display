@@ -4,10 +4,13 @@ Upload GIFs to your Epomaker RT82 keyboard's LCD screen.
 """
 
 from pathlib import Path
+import subprocess
+import tempfile
 import time
 
 import click
 import hid
+from PIL import Image
 
 from .theme import (
     console, success, error, warning, info, muted,
@@ -18,6 +21,79 @@ from .hid_device import find_devices
 from .protocol import QGIF_MAGIC, is_qgif_data
 
 __version__ = "0.1.0"
+
+# Path to native encoder
+NATIVE_ENCODER = Path(__file__).parent.parent / "wasm2c_runtime" / "test_qgif"
+
+# QGIF size limit (firmware buffer constraint)
+QGIF_SIZE_LIMIT = 65536  # 64KB
+
+
+def encode_gif_to_qgif(gif_path: Path, output_path: Path) -> bool:
+    """
+    Encode a GIF to QGIF using the native wasm2c encoder.
+    
+    Returns True on success.
+    """
+    WIDTH, HEIGHT = 240, 136  # Must be divisible by 4
+    
+    if not NATIVE_ENCODER.exists():
+        raise FileNotFoundError(
+            f"Native encoder not built. Run:\n"
+            f"  cd {NATIVE_ENCODER.parent} && ./build.sh"
+        )
+    
+    # Load GIF frames
+    with Image.open(gif_path) as gif:
+        frames = []
+        try:
+            while True:
+                frame = gif.copy().convert('RGBA')
+                frame = frame.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+                frames.append(frame)
+                gif.seek(gif.tell() + 1)
+        except EOFError:
+            pass
+    
+    if not frames:
+        raise ValueError("No frames found in GIF")
+    
+    # Save frames as PNG and encode
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        for i, frame in enumerate(frames):
+            frame.save(tmpdir / f"input_{i}.png", 'PNG')
+        
+        input_pattern = str(tmpdir / "input_X.png")
+        output_str = str(output_path.absolute())
+        
+        result = subprocess.run(
+            [str(NATIVE_ENCODER), input_pattern, output_str, str(len(frames))],
+            capture_output=True,
+            text=True
+        )
+        
+        return result.returncode == 0
+
+
+def patch_qgif_header(qgif_path: Path) -> int:
+    """
+    Patch QGIF header byte 5 from 0x05 to 0x03 for display compatibility.
+    
+    Returns the file size after patching.
+    """
+    data = bytearray(qgif_path.read_bytes())
+    
+    if len(data) < 10:
+        raise ValueError("QGIF file too small")
+    
+    # Patch byte 5 if needed
+    if data[5] == 0x05:
+        data[5] = 0x03
+        qgif_path.write_bytes(data)
+    
+    return len(data)
 
 
 def upload_to_device(data: bytes, frame_count: int = 1, fps: int = 8) -> bool:
@@ -135,7 +211,7 @@ def main():
 
 @main.command()
 @click.argument('file_path', type=click.Path(exists=True, path_type=Path))
-@click.option('--raw', is_flag=True, help='Send raw RGB565 with fake QGIF header (experimental)')
+@click.option('--raw', is_flag=True, help='Send raw RGB565 (experimental, likely garbled)')
 @click.option('--fps', default=8, help='Frames per second (default: 8)')
 def upload(file_path: Path, raw: bool, fps: int):
     """Upload a GIF or QGIF file to the RT82 display.
@@ -143,38 +219,50 @@ def upload(file_path: Path, raw: bool, fps: int):
     FILE_PATH is the path to the file to upload.
     
     Supports:
-      - .qgif files (pre-compressed, best quality)
-      - .gif files with --raw flag (experimental, may show garbled)
+      - .qgif files (pre-compressed)
+      - .gif files (auto-encoded with native QGIF encoder)
     
-    For best results, capture QGIF from the web tool:
-      https://image.rdmctmzt.com/
+    Note: The RT82 has a ~64KB buffer limit. Simple GIFs with solid colors
+    work best. Complex patterns may cause display artifacts.
     """
     print_banner()
     console.print()
     
     # Check file type
     is_qgif_file = file_path.suffix.lower() == '.qgif'
+    is_gif_file = file_path.suffix.lower() == '.gif'
     
     if is_qgif_file:
         # Load pre-compressed QGIF
         print_header("Loading QGIF", "📦")
-        qgif_data = file_path.read_bytes()
+        qgif_data = bytearray(file_path.read_bytes())
         
-        if not is_qgif_data(qgif_data):
+        if not is_qgif_data(bytes(qgif_data)):
             error("File does not have valid QGIF header (expected 'QGIF' magic)")
             raise click.Abort()
+        
+        # Auto-patch byte 5 if needed
+        if len(qgif_data) > 5 and qgif_data[5] == 0x05:
+            qgif_data[5] = 0x03
+            muted("  🔧 Patched header for compatibility")
         
         muted(f"  📄 {file_path.name}")
         muted(f"  💾 {format_bytes(len(qgif_data))}")
         
-        # Extract frame info from header if possible
+        # Extract frame info from header
         frame_count = qgif_data[7] if len(qgif_data) > 7 else 1
+        data = bytes(qgif_data)
         
-        data = qgif_data
+        # Warn about size
+        if len(data) > QGIF_SIZE_LIMIT:
+            console.print()
+            warning(f"File exceeds 64KB limit ({format_bytes(len(data))})")
+            muted("  This may cause display artifacts (diagonal lines, garbage frames).")
+            muted("  Try a simpler GIF with solid colors and minimal patterns.")
         
-    else:
-        # Load GIF and convert to RGB565
-        print_header("Processing GIF", "🖼️")
+    elif is_gif_file and not raw:
+        # Encode GIF using native encoder
+        print_header("Encoding GIF", "🎬")
         
         try:
             gif = load_gif(file_path)
@@ -183,35 +271,56 @@ def upload(file_path: Path, raw: bool, fps: int):
             raise click.Abort()
         
         muted(f"  📄 {file_path.name}")
-        muted(f"  📐 {gif.width}x{gif.height} pixels")
+        muted(f"  📐 {gif.width}x{gif.height} → 240x136")
         muted(f"  🎞️  {gif.total_frames} frames")
-        muted(f"  💾 {format_bytes(gif.total_size)} (RGB565)")
         
-        if not raw:
+        # Check if native encoder is available
+        if not NATIVE_ENCODER.exists():
             console.print()
-            warning("RT82 requires QGIF format!")
+            warning("Native QGIF encoder not built!")
+            muted(f"  Build it with: cd {NATIVE_ENCODER.parent} && ./build.sh")
             console.print()
-            muted("  The device uses proprietary QGIF compression.")
-            muted("  Options:")
-            muted("    • Use web tool: https://image.rdmctmzt.com/")
-            muted("    • Capture QGIF with browser console interceptor")
-            muted("    • Use --raw flag (experimental, shows garbled)")
-            console.print()
+            muted("  Alternative: use the web tool https://image.rdmctmzt.com/")
+            muted("  to create a .qgif file, then upload that.")
+            raise click.Abort()
+        
+        # Encode to temporary QGIF
+        with tempfile.NamedTemporaryFile(suffix='.qgif', delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        
+        try:
+            muted("  ⚙️  Compressing with native encoder...")
             
-            if not click.confirm("Try raw upload anyway?", default=False):
+            if not encode_gif_to_qgif(file_path, tmp_path):
+                error("QGIF encoding failed")
                 raise click.Abort()
+            
+            # Read and patch the QGIF
+            qgif_data = bytearray(tmp_path.read_bytes())
+            
+            if len(qgif_data) > 5 and qgif_data[5] == 0x05:
+                qgif_data[5] = 0x03
+            
+            frame_count = gif.total_frames
+            data = bytes(qgif_data)
+            
+            muted(f"  ✅ Encoded: {format_bytes(len(data))}")
+            
+            # Warn about size
+            if len(data) > QGIF_SIZE_LIMIT:
+                console.print()
+                warning(f"Output exceeds 64KB limit ({format_bytes(len(data))})")
+                muted("  This may cause display artifacts.")
+                muted("  Try a simpler GIF with solid colors and minimal patterns.")
+                console.print()
+                if not click.confirm("Upload anyway?", default=True):
+                    raise click.Abort()
+        finally:
+            tmp_path.unlink(missing_ok=True)
         
-        # Create fake QGIF header + raw RGB565
-        rgb565_data = b''.join(frame.data for frame in gif.frames)
-        qgif_header = bytes([
-            0x51, 0x47, 0x49, 0x46,  # "QGIF" magic
-            0x00, 0x0F,              # Width param (240/16 = 15)
-            0x00, gif.total_frames,  # Frame count
-            0x3B, 0x21,              # Unknown
-        ]) + bytes([0xFF] * 22)      # Padding (32 byte header)
-        
-        data = qgif_header + rgb565_data
-        frame_count = gif.total_frames
+    else:
+        error("Raw RGB565 mode is not supported")
+        raise click.Abort()
     
     console.print()
     print_header("Uploading", "📤")
@@ -220,10 +329,6 @@ def upload(file_path: Path, raw: bool, fps: int):
         upload_to_device(data, frame_count=frame_count, fps=fps)
         console.print()
         success("Upload complete!")
-        
-        if not is_qgif_file:
-            muted("  Note: Raw RGB565 may not display correctly.")
-            muted("  Use a .qgif file for proper image display.")
             
     except ConnectionError as e:
         console.print()
@@ -302,6 +407,63 @@ def info_cmd():
     muted("    2. Upload your GIF")
     muted("    3. Use browser console to capture QGIF data")
     muted("    4. Upload the .qgif file with: rt82display upload file.qgif")
+
+
+@main.command()
+@click.argument('gif_path', type=click.Path(exists=True, path_type=Path))
+@click.argument('output_path', type=click.Path(path_type=Path))
+def encode(gif_path: Path, output_path: Path):
+    """Encode a GIF file to QGIF format.
+    
+    Uses the native wasm2c encoder (same code as web tool).
+    
+    Note: Simple GIFs with solid colors compress best.
+    Complex patterns may exceed the 64KB display limit.
+    """
+    print_banner()
+    console.print()
+    
+    print_header("Encoding to QGIF", "🎬")
+    
+    # Check native encoder
+    if not NATIVE_ENCODER.exists():
+        error("Native encoder not built!")
+        muted(f"  Run: cd {NATIVE_ENCODER.parent} && ./build.sh")
+        raise click.Abort()
+    
+    try:
+        gif = load_gif(gif_path)
+    except Exception as e:
+        error(f"Failed to load GIF: {e}")
+        raise click.Abort()
+    
+    muted(f"  📄 {gif_path.name}")
+    muted(f"  📐 {gif.width}x{gif.height} → 240x136")
+    muted(f"  🎞️  {gif.total_frames} frames")
+    
+    muted("  ⚙️  Compressing...")
+    
+    try:
+        if not encode_gif_to_qgif(gif_path, output_path):
+            error("Encoding failed")
+            raise click.Abort()
+        
+        # Patch header
+        file_size = patch_qgif_header(output_path)
+        
+        console.print()
+        success(f"Saved: {output_path}")
+        muted(f"  💾 {format_bytes(file_size)}")
+        
+        if file_size > QGIF_SIZE_LIMIT:
+            console.print()
+            warning(f"File exceeds 64KB limit!")
+            muted("  This may cause display artifacts on the RT82.")
+            muted("  Try a simpler GIF with solid colors.")
+        
+    except Exception as e:
+        error(f"Failed: {e}")
+        raise click.Abort()
 
 
 @main.command()

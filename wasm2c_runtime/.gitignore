@@ -1,0 +1,5 @@
+# Built binaries (platform-specific)
+*.dylib
+*.so
+*.dll
+test_qgif
