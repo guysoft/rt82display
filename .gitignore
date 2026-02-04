@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+
+# Environment
+.env
+.envrc
+
+# WASM decode (not working yet)
+qgif.js
+qgif.wasm
+qgif_encoder.js
+encode_qgif.mjs
+node_modules/
+package.json
+package-lock.json
+
+# Test files and captures
+*.qgif
+*.gif
+*.png
+capture_log.json
+CAPTURE_*.js
+make_test_gif.py

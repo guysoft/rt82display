@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rt82display"
+version = "0.1.0"
+description = "CLI tool to upload GIFs to Epomaker RT82 keyboard LCD screen"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "Guy Sheffer" }
+]
+keywords = ["epomaker", "rt82", "keyboard", "lcd", "gif", "hid"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "hidapi>=0.14.0",
+    "Pillow>=10.0.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+rt82display = "rt82display.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/guysoft/rt82display"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rt82display"]
