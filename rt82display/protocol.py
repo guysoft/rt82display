@@ -136,13 +136,17 @@ def build_screen_prep_packet() -> Packet:
     return _make_packet(CMD_SCREEN_PREP, data)
 
 
-def build_transfer_setup_packet(offset: int, file_size: int, screen_index: int = 0, 
-                                 frame_count: int = 1, fps: int = 8) -> Packet:
+def build_transfer_setup_packet(offset: int, file_size: int, screen_index: int = 0,
+                                 screen_count: int = 1,
+                                 erase_count: int = None) -> Packet:
     """Build transfer setup packet (0x15).
     
-    From capture: aa 15 00 00 00 38 00 00 00 01 07 00 00 f9 f0 05
-    Structure: [offset_L] [offset_H] 00 38 00 00 [screen] [frames] [fps] 00 00 [size_L] [size_M] [size_H]
+    From web tool: aa 15 00 00 00 38 00 00 00 [screen_count] [erase_count] 00 00 [size_L] [size_M] [size_H]
+    
+    erase_count = ceil(file_size / 65536) + 1 (number of 64KB flash blocks to erase).
     """
+    if erase_count is None:
+        erase_count = (file_size + 65535) // 65536 + 1
     data = bytes([
         offset & 0xFF,           # Offset low
         (offset >> 8) & 0xFF,    # Offset high
@@ -150,8 +154,8 @@ def build_transfer_setup_packet(offset: int, file_size: int, screen_index: int =
         SCREEN_PARAM,
         0x00, 0x00,
         screen_index,            # Screen index
-        frame_count,             # Frame count (or 1 for single)
-        fps,                     # FPS (7-8 typical)
+        screen_count,            # Screen count (1 for single upload)
+        erase_count,             # Erase count (flash blocks)
         0x00, 0x00,
         file_size & 0xFF,        # Size low byte
         (file_size >> 8) & 0xFF, # Size middle byte
@@ -167,29 +171,36 @@ def build_transfer_ready_packet() -> Packet:
     return _make_packet(CMD_TRANSFER_READY, data)
 
 
-def build_frame_info_packet(screen_count: int = 1, fps: int = 7) -> Packet:
+def build_frame_info_packet(screen_count: int = 1, erase_count: int = 2) -> Packet:
     """Build frame info packet (0x18).
     
-    From capture: aa 18 00 00 00 01 00 00 07
+    From web tool: aa 18 00 00 00 [screen_count] 00 00 [erase_count]
+    
+    erase_count should match the value from the setup packet.
+    The device needs time after this command to erase flash (500ms * erase_count).
     """
-    data = bytes([0x00, 0x00, 0x00, screen_count, 0x00, 0x00, fps])
+    data = bytes([0x00, 0x00, 0x00, screen_count, 0x00, 0x00, erase_count])
     return _make_packet(CMD_FRAME_INFO, data)
 
 
 def build_data_packet(offset: int, chunk: bytes) -> Packet:
     """Build data packet (0x19).
     
-    Structure: aa 19 [offset_L] [offset_H] 00 38 00 00 [56 bytes data]
+    Structure: aa 19 [offset_L] [offset_M] [offset_H] [chunk_len] 00 00 [56 bytes data]
+    
+    Offset is 24-bit (3 bytes), supporting files up to 16MB.
+    chunk_len is the actual number of data bytes in this packet.
     """
+    chunk_len = len(chunk)
     # Pad chunk to 56 bytes
-    if len(chunk) < DATA_CHUNK_SIZE:
-        chunk = chunk + bytes(DATA_CHUNK_SIZE - len(chunk))
+    if chunk_len < DATA_CHUNK_SIZE:
+        chunk = chunk + bytes(DATA_CHUNK_SIZE - chunk_len)
     
     data = bytes([
-        offset & 0xFF,           # Offset low
-        (offset >> 8) & 0xFF,    # Offset high
-        0x00,
-        SCREEN_PARAM,
+        offset & 0xFF,           # Offset low byte
+        (offset >> 8) & 0xFF,    # Offset mid byte
+        (offset >> 16) & 0xFF,   # Offset high byte (24-bit)
+        chunk_len,               # Actual data length in this packet
         0x00, 0x00
     ]) + chunk[:DATA_CHUNK_SIZE]
     
@@ -206,6 +217,7 @@ def build_qgif_transfer(qgif_data: bytes, frame_count: int = 1, fps: int = 8) ->
     This replicates the exact sequence captured from the web interface.
     """
     file_size = len(qgif_data)
+    erase_count = (file_size + 65535) // 65536 + 1
     
     # Phase 1: Init sequence
     yield build_init_packet()
@@ -228,11 +240,13 @@ def build_qgif_transfer(qgif_data: bytes, frame_count: int = 1, fps: int = 8) ->
     yield build_screen_prep_packet()
     
     # Phase 4: Transfer setup
-    yield build_transfer_setup_packet(0, file_size, screen_index=0, frame_count=frame_count, fps=fps)
+    yield build_transfer_setup_packet(0, file_size, screen_index=0,
+                                       screen_count=1, erase_count=erase_count)
     yield build_transfer_setup_packet(SCREEN_PARAM, 0)  # Second setup packet
     yield build_transfer_setup_packet(0x70, 0)  # Third setup packet (0x70 = 112)
     yield build_transfer_ready_packet()
-    yield build_frame_info_packet(screen_count=1, fps=fps)
+    yield build_frame_info_packet(screen_count=1, erase_count=erase_count)
+    # NOTE: Caller must sleep(0.5 * erase_count) after frame_info for flash erase
     
     # Phase 5: Data transfer
     offset = 0

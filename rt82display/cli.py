@@ -7,10 +7,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
+from typing import Optional
 
 import click
 import hid
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .theme import (
     console, success, error, warning, info, muted,
@@ -25,7 +26,7 @@ __version__ = "0.1.0"
 # Path to native encoder
 NATIVE_ENCODER = Path(__file__).parent.parent / "wasm2c_runtime" / "test_qgif"
 
-# QGIF size limit (firmware buffer constraint)
+# Default QGIF compression target (used by compress_gif_to_fit)
 QGIF_SIZE_LIMIT = 65536  # 64KB
 
 
@@ -77,6 +78,136 @@ def encode_gif_to_qgif(gif_path: Path, output_path: Path) -> bool:
         return result.returncode == 0
 
 
+def encode_frames_to_qgif(frames: list[Image.Image], output_path: Path) -> bool:
+    """
+    Encode a list of PIL Image frames to QGIF using the native wasm2c encoder.
+    
+    Args:
+        frames: List of PIL Image frames (will be resized to 240x136)
+        output_path: Path for the output QGIF file
+    
+    Returns True on success.
+    """
+    WIDTH, HEIGHT = 240, 136  # Must be divisible by 4
+    
+    if not NATIVE_ENCODER.exists():
+        raise FileNotFoundError(
+            f"Native encoder not built. Run:\n"
+            f"  cd {NATIVE_ENCODER.parent} && ./build.sh"
+        )
+    
+    if not frames:
+        raise ValueError("No frames provided")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        for i, frame in enumerate(frames):
+            resized = frame.convert('RGBA').resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+            resized.save(tmpdir / f"input_{i}.png", 'PNG')
+        
+        input_pattern = str(tmpdir / "input_X.png")
+        output_str = str(output_path.absolute())
+        
+        result = subprocess.run(
+            [str(NATIVE_ENCODER), input_pattern, output_str, str(len(frames))],
+            capture_output=True,
+            text=True
+        )
+        
+        return result.returncode == 0
+
+
+def compress_gif_to_fit(
+    gif_path: Path,
+    max_size: int = QGIF_SIZE_LIMIT,
+) -> Optional[tuple[bytes, int, str]]:
+    """
+    Try progressively more aggressive compression until QGIF fits under max_size.
+    
+    Strategies (in order of aggressiveness):
+      1. Posterize colors (fewer unique colors → better RLE compression)
+      2. Drop frames (every 2nd, 3rd, etc.)
+      3. Combinations of both
+    
+    Args:
+        gif_path: Path to the input GIF
+        max_size: Maximum output size in bytes (default 64KB)
+    
+    Returns:
+        (qgif_data, frame_count, description) on success, or None if nothing works.
+    """
+    # Load all frames from the GIF
+    with Image.open(gif_path) as gif:
+        all_frames = []
+        try:
+            while True:
+                all_frames.append(gif.copy().convert('RGBA'))
+                gif.seek(gif.tell() + 1)
+        except EOFError:
+            pass
+    
+    if not all_frames:
+        return None
+    
+    total_frames = len(all_frames)
+    
+    # Posterize bits: 8 = no change, lower = fewer colors
+    posterize_levels = [8, 6, 5, 4, 3]
+    # Frame skip: 1 = keep all, 2 = every other, etc.
+    max_skip = min(total_frames, 8)
+    frame_skips = list(range(1, max_skip + 1))
+    
+    for skip in frame_skips:
+        for bits in posterize_levels:
+            # Select frames
+            selected = all_frames[::skip]
+            kept = len(selected)
+            
+            # Apply posterization if needed
+            if bits < 8:
+                processed = [ImageOps.posterize(f.convert('RGB'), bits).convert('RGBA')
+                             for f in selected]
+            else:
+                processed = selected
+            
+            # Encode to temp file
+            with tempfile.NamedTemporaryFile(suffix='.qgif', delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            
+            try:
+                ok = encode_frames_to_qgif(processed, tmp_path)
+                if not ok:
+                    continue
+                
+                qgif_data = bytearray(tmp_path.read_bytes())
+                
+                # Patch header for compatibility
+                if len(qgif_data) > 5 and qgif_data[5] == 0x05:
+                    qgif_data[5] = 0x03
+                
+                size = len(qgif_data)
+                
+                if size <= max_size:
+                    # Build description of what changed
+                    changes = []
+                    if skip > 1:
+                        changes.append(f"{kept}/{total_frames} frames")
+                    if bits < 8:
+                        colors = 2 ** bits
+                        changes.append(f"{colors} colors/channel")
+                    desc = ", ".join(changes) if changes else "no changes needed"
+                    
+                    return bytes(qgif_data), kept, desc
+                
+                # Show progress
+                muted(f"  trying {kept} frames, {2**bits if bits < 8 else 'full'} colors → {format_bytes(size)}")
+            finally:
+                tmp_path.unlink(missing_ok=True)
+    
+    return None
+
+
 def patch_qgif_header(qgif_path: Path) -> int:
     """
     Patch QGIF header byte 5 from 0x05 to 0x03 for display compatibility.
@@ -109,6 +240,26 @@ def upload_to_device(data: bytes, frame_count: int = 1, fps: int = 8) -> bool:
         time.sleep(delay)
         return result >= 0
     
+    def send65(dev, pkt, delay=0.0):
+        """Send a 65-byte packet (report ID 0x00 prefix) to the 0x1919 device.
+        
+        The web tool sends 65-byte HID reports:
+          - byte[0] = 0x00 (report ID)
+          - bytes[1..64] = packet data (0xAA command + payload)
+        And reads a response after every write for flow control.
+        """
+        padded = pkt + [0] * (64 - len(pkt))
+        packet = bytes([0x00] + padded)  # 65 bytes: report ID 0x00 + data
+        result = dev.write(packet)
+        # Read response for flow control (like the web tool does)
+        try:
+            resp = dev.read(64, timeout_ms=500)
+        except Exception:
+            resp = None
+        if delay > 0:
+            time.sleep(delay)
+        return result >= 0
+    
     # Step 1: Init on 36B0 to activate 1919 device
     info("Initializing display...")
     dev36 = None
@@ -125,7 +276,7 @@ def upload_to_device(data: bytes, frame_count: int = 1, fps: int = 8) -> bool:
     send(dev36, [0xAA, 0xE2])
     for _ in range(5):
         send(dev36, [0xAA, 0xE0])
-    dev36.close()
+    # Keep dev36 open - we need it later for AA E3
     
     time.sleep(0.3)
     
@@ -135,66 +286,99 @@ def upload_to_device(data: bytes, frame_count: int = 1, fps: int = 8) -> bool:
         if d.get('usage_page') == 0xFF:
             dev = hid.device()
             dev.open_path(d['path'])
-            dev.set_nonblocking(True)
+            dev.set_nonblocking(False)  # Blocking reads for flow control
             break
     
     if not dev:
+        dev36.close()
         raise ConnectionError("LCD interface (0x1919) did not appear after init")
     
     try:
-        # Query and download mode
+        # LCD init sequence on 0x1919
         muted("  Entering download mode...")
-        send(dev, [0xAA, 0x10])
-        send(dev, [0xAA, 0x17, 0,0,0,0x38,0,0, 2,0,2,6,0,2,3,0,4,0,9,1])
-        send(dev, [0xAA, 0x11])
-        send(dev, [0xAA, 0x1C])
-        send(dev, [0xAA, 0x10])
-        send(dev, [0xAA, 0x12, 0,0,0,0x38])
-        send(dev, [0xAA, 0x11])
-        send(dev, [0xAA, 0x1C])
+        send65(dev, [0xAA, 0x10])
+        send65(dev, [0xAA, 0x17, 0,0,0,0x38,0,0, 2,0,2,6,0,2,3,0,4,0,9,1])
+        send65(dev, [0xAA, 0x11])
+        send65(dev, [0xAA, 0x1C])
+        send65(dev, [0xAA, 0x10])
+        send65(dev, [0xAA, 0x12, 0,0,0,0x38])
+        send65(dev, [0xAA, 0x11])
+        send65(dev, [0xAA, 0x1C])
         
-        # Download mode trigger
-        send(dev, [0xAA, 0x1B, 0,0,0,0x38])
-        send(dev, [0xAA, 0xE3, 0,0,0,1,0,0,1], delay=0.1)
-        send(dev, [0xAA, 0x14, 0,0,0,0x38])
+        # Send AA E3 (getGifCount) on KEYBOARD device (0x36B0).
+        # The web tool sends this on the keyboard's 32-byte interface,
+        # with both devices open, right before starting the transfer.
+        send(dev36, [0xAA, 0xE3, 0,0,0,1,0,0, 1])  # 1 screen
+        dev36.close()
         
-        # Transfer setup
+        # Prepare and screen prep on LCD
+        send65(dev, [0xAA, 0x1B, 0,0,0,0x38])
+        send65(dev, [0xAA, 0xE3, 0,0,0,1,0,0,1])
+        send65(dev, [0xAA, 0x14, 0,0,0,0x38])
+        
+        # Transfer setup (matching web tool exactly)
         muted("  Setting up transfer...")
-        setup = [0xAA, 0x15, 0,0, 0,0x38, 0,0, 0, frame_count, fps, 0,0,
+        erase_count = (file_size + 65535) // 65536 + 1
+        setup = [0xAA, 0x15, 0,0, 0,0x38, 0,0,
+                 0, 1, erase_count, 0, 0,
                  file_size & 0xFF, (file_size >> 8) & 0xFF, (file_size >> 16) & 0xFF]
-        send(dev, setup)
-        send(dev, [0xAA, 0x15, 0x38,0, 0,0x38])
-        send(dev, [0xAA, 0x15, 0x70,0, 0,0x10])
-        send(dev, [0xAA, 0x16, 0,0,0,0x38])
-        send(dev, [0xAA, 0x18, 0,0,0,1,0,0, fps])
+        send65(dev, setup)
+        send65(dev, [0xAA, 0x15, 0x38,0, 0,0x38])
+        send65(dev, [0xAA, 0x15, 0x70,0, 0,0x10])
+        send65(dev, [0xAA, 0x16, 0,0,0,0x38])
+        send65(dev, [0xAA, 0x18, 0,0,0,1,0,0, erase_count])
+        muted(f"  Erasing {erase_count} blocks ({format_bytes(file_size)})...")
+        time.sleep(0.5 * erase_count)  # Wait for flash erase (500ms per 64KB block)
         
-        # Data transfer
+        # Data transfer with write-then-read flow control
         CHUNK_SIZE = 56
         offset = 0
         packets_sent = 0
         total_packets = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+        start_time = time.time()
         
         while offset < file_size:
             chunk = data[offset:offset + CHUNK_SIZE]
-            if len(chunk) < CHUNK_SIZE:
-                chunk = chunk + bytes(CHUNK_SIZE - len(chunk))
+            chunk_len = len(chunk)
+            if chunk_len < CHUNK_SIZE:
+                chunk = chunk + bytes(CHUNK_SIZE - chunk_len)
             
-            pkt = [0xAA, 0x19, offset & 0xFF, (offset >> 8) & 0xFF, 0, 0x38, 0, 0] + list(chunk)
-            send(dev, pkt, delay=0.001)
+            pkt = [0xAA, 0x19,
+                   offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
+                   chunk_len, 0, 0] + list(chunk)
+            send65(dev, pkt)
             
             offset += CHUNK_SIZE
             packets_sent += 1
             
-            if packets_sent % 100 == 0 or packets_sent == total_packets:
+            if packets_sent % 200 == 0 or packets_sent == total_packets:
+                elapsed = time.time() - start_time
+                rate = packets_sent / elapsed if elapsed > 0 else 0
                 percent = (packets_sent / total_packets) * 100
-                console.print(f"  [info]📦[/info] Packet {packets_sent}/{total_packets} ({percent:.0f}%)", end='\r')
+                console.print(f"  [info]📦[/info] {packets_sent}/{total_packets} ({percent:.0f}%) [{rate:.0f} pkt/s]", end='\r')
         
         console.print()  # Clear line
         
-        # Finalize
+        # Finalize (matching web tool exactly: End → syncTime → Start)
         muted("  Finalizing...")
-        send(dev, [0xAA, 0x1C])
-        send(dev, [0xAA, 0x1A, 0,0,0,0x38])
+        send65(dev, [0xAA, 0x1A])  # End (clean, no extra bytes)
+        # syncTime: Query → Time config → Start (matching web tool)
+        import datetime
+        send65(dev, [0xAA, 0x10])  # Query
+        sync = [0xAA, 0x17, 0,0,0,0x38,0,0]
+        now = datetime.datetime.now()
+        yr = now.year
+        sync.extend([
+            (yr // 1000) % 10, (yr // 100) % 10, (yr // 10) % 10, yr % 10,
+            ((now.month) // 10) % 10, (now.month) % 10,
+            now.weekday() % 7,
+            (now.day // 10) % 10, now.day % 10,
+            (now.hour // 10) % 10, now.hour % 10,
+            (now.minute // 10) % 10, now.minute % 10,
+            (now.second // 10) % 10, now.second % 10
+        ])
+        send65(dev, sync)
+        send65(dev, [0xAA, 0x11])  # Start
         
         return True
         
@@ -222,8 +406,8 @@ def upload(file_path: Path, raw: bool, fps: int):
       - .qgif files (pre-compressed)
       - .gif files (auto-encoded with native QGIF encoder)
     
-    Note: The RT82 has a ~64KB buffer limit. Simple GIFs with solid colors
-    work best. Complex patterns may cause display artifacts.
+    Supports files larger than 64KB using 24-bit offset addressing.
+    Simple GIFs with solid colors compress best.
     """
     print_banner()
     console.print()
@@ -252,13 +436,6 @@ def upload(file_path: Path, raw: bool, fps: int):
         # Extract frame info from header
         frame_count = qgif_data[7] if len(qgif_data) > 7 else 1
         data = bytes(qgif_data)
-        
-        # Warn about size
-        if len(data) > QGIF_SIZE_LIMIT:
-            console.print()
-            warning(f"File exceeds 64KB limit ({format_bytes(len(data))})")
-            muted("  This may cause display artifacts (diagonal lines, garbage frames).")
-            muted("  Try a simpler GIF with solid colors and minimal patterns.")
         
     elif is_gif_file and not raw:
         # Encode GIF using native encoder
@@ -305,16 +482,6 @@ def upload(file_path: Path, raw: bool, fps: int):
             data = bytes(qgif_data)
             
             muted(f"  ✅ Encoded: {format_bytes(len(data))}")
-            
-            # Warn about size
-            if len(data) > QGIF_SIZE_LIMIT:
-                console.print()
-                warning(f"Output exceeds 64KB limit ({format_bytes(len(data))})")
-                muted("  This may cause display artifacts.")
-                muted("  Try a simpler GIF with solid colors and minimal patterns.")
-                console.print()
-                if not click.confirm("Upload anyway?", default=True):
-                    raise click.Abort()
         finally:
             tmp_path.unlink(missing_ok=True)
         
@@ -418,7 +585,6 @@ def encode(gif_path: Path, output_path: Path):
     Uses the native wasm2c encoder (same code as web tool).
     
     Note: Simple GIFs with solid colors compress best.
-    Complex patterns may exceed the 64KB display limit.
     """
     print_banner()
     console.print()
@@ -454,12 +620,6 @@ def encode(gif_path: Path, output_path: Path):
         console.print()
         success(f"Saved: {output_path}")
         muted(f"  💾 {format_bytes(file_size)}")
-        
-        if file_size > QGIF_SIZE_LIMIT:
-            console.print()
-            warning(f"File exceeds 64KB limit!")
-            muted("  This may cause display artifacts on the RT82.")
-            muted("  Try a simpler GIF with solid colors.")
         
     except Exception as e:
         error(f"Failed: {e}")
