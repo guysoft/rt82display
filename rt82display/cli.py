@@ -263,12 +263,30 @@ def upload_to_device(data: bytes, frame_count: int = 1, fps: int = 8) -> bool:
     # Step 1: Init on 36B0 to activate 1919 device
     info("Initializing display...")
     dev36 = None
-    for d in hid.enumerate(0x36B0, 0x30A3):
+    # Enumerate all 0x36B0:0x30A3 devices and pick the raw HID interface.
+    # On macOS: usage_page is reported correctly, so we match 0xFF60.
+    # On Linux (libusb backend): usage_page is 0 for all interfaces, so we
+    # fall back to interface_number == 1 (the standard QMK raw HID interface).
+    kbd_devices = list(hid.enumerate(0x36B0, 0x30A3))
+    target_kbd = None
+    # Priority 1: exact usage_page match
+    for d in kbd_devices:
         if d.get('usage_page') == 0xFF60:
-            dev36 = hid.device()
-            dev36.open_path(d['path'])
-            dev36.set_nonblocking(True)
+            target_kbd = d
             break
+    # Priority 2: interface 1 (QMK raw HID convention) when usage_page unknown
+    if target_kbd is None:
+        for d in kbd_devices:
+            if d.get('interface_number') == 1:
+                target_kbd = d
+                break
+    # Priority 3: any device with this VID:PID
+    if target_kbd is None and kbd_devices:
+        target_kbd = kbd_devices[0]
+    if target_kbd is not None:
+        dev36 = hid.device()
+        dev36.open_path(target_kbd['path'])
+        dev36.set_nonblocking(True)
     
     if not dev36:
         raise ConnectionError("Could not find keyboard interface (0x36B0)")
@@ -278,16 +296,33 @@ def upload_to_device(data: bytes, frame_count: int = 1, fps: int = 8) -> bool:
         send(dev36, [0xAA, 0xE0])
     # Keep dev36 open - we need it later for AA E3
     
-    time.sleep(0.3)
-    
-    # Step 2: Connect to 1919 device
+    # Step 2: Wait for 0x1919 LCD device to appear.
+    # On macOS this is near-instant (~300ms), but on Linux the USB re-enumeration
+    # through the libusb backend can take 1-2 seconds. Poll with retries.
     dev = None
-    for d in hid.enumerate(0x1919, 0x1919):
-        if d.get('usage_page') == 0xFF:
-            dev = hid.device()
-            dev.open_path(d['path'])
-            dev.set_nonblocking(False)  # Blocking reads for flow control
+    target_lcd = None
+    for attempt in range(10):
+        time.sleep(0.3)
+        lcd_devices = list(hid.enumerate(0x1919, 0x1919))
+        # Prefer usage_page 0xFF (macOS); fall back to IF=1 then first (Linux).
+        for d in lcd_devices:
+            if d.get('usage_page') == 0xFF:
+                target_lcd = d
+                break
+        if target_lcd is None:
+            for d in lcd_devices:
+                if d.get('interface_number') == 1:
+                    target_lcd = d
+                    break
+        if target_lcd is None and lcd_devices:
+            target_lcd = lcd_devices[0]
+        if target_lcd is not None:
             break
+    
+    if target_lcd is not None:
+        dev = hid.device()
+        dev.open_path(target_lcd['path'])
+        dev.set_nonblocking(False)  # Blocking reads for flow control
     
     if not dev:
         dev36.close()

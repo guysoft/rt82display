@@ -4,11 +4,38 @@ Upload GIFs to your Epomaker RT82 keyboard's LCD screen from the command line.
 
 ## Installation
 
+### Prerequisites
+
+**All platforms:**
+- Python 3.10+
+- A C compiler (gcc/clang) for the native QGIF encoder
+
+**Linux (Debian/Ubuntu):**
+
+Install system libraries needed by the `hidapi` Python package:
+
+```bash
+sudo apt install libusb-1.0-0-dev libudev-dev python3-dev
+```
+
+Set up udev rules so the tool can access the keyboard without root:
+
+```bash
+sudo cp udev/99-rt82.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Then unplug and replug the keyboard.
+
+**macOS:** No extra system dependencies required.
+
 ### 1. Install Python package
 
 ```bash
 cd rt82display
-uv pip install -e .
+pip install -e .
+# or: uv pip install -e .
 ```
 
 ### 2. Build the native QGIF encoder
@@ -101,5 +128,6 @@ See [AGENTS.md](AGENTS.md) for detailed troubleshooting steps.
 ### Quick fixes:
 
 - **Device not found**: Unplug and replug keyboard
+- **Permission denied (Linux)**: Install the udev rules (see Prerequisites above) and replug
 - **Screen stuck on "Downloading"**: Unplug and replug
 - **Garbled display**: GIF likely exceeds 64KB limit, try simpler patterns

@@ -14,11 +14,20 @@ rt82display upload <file.qgif>
 
 ### Device Not Detected
 
-**Symptom**: `LCD interface (0x1919) did not appear after init`
+**Symptom**: `Could not find keyboard interface (0x36B0)` or `LCD interface (0x1919) did not appear after init`
 
 **Cause**: The RT82 has TWO USB devices:
 - `0x36B0:0x30A3` - Always visible (keyboard)
 - `0x1919:0x1919` - Only appears AFTER init commands sent to 0x36B0
+
+**Cross-OS note**: On **macOS**, `hid.enumerate()` reports the `usage_page` field correctly (e.g. `0xFF60` for the keyboard interface). On **Linux** with the `libusb` backend (common default), `usage_page` is returned as `0` for all interfaces. The `0x36B0` device exposes three interfaces:
+- IF=0: Keyboard (usage page 0x0001)
+- IF=1: **Raw HID** (usage page 0xFF60) -- **this is the one needed for init**
+- IF=2: Mouse/consumer (usage page 0x0001)
+
+The CLI handles this by: (1) preferring the correct `usage_page` when available, (2) falling back to `interface_number == 1` (the standard QMK raw HID interface), (3) falling back to the first match as last resort.
+
+Additionally, USB re-enumeration is slower on Linux (~1-2 seconds) than macOS (~300ms). The CLI polls for the `0x1919` device with retries rather than a single fixed sleep.
 
 **Solution**: The CLI should automatically handle this, but if it fails:
 
@@ -27,33 +36,58 @@ rt82display upload <file.qgif>
 rt82display list
 ```
 
-2. **Manually activate LCD interface**:
+2. **(Linux only) Install udev rules** so non-root users can access the HID device:
+```bash
+sudo cp udev/99-rt82.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+Then unplug and replug the keyboard.
+
+3. **Manually activate LCD interface**:
 ```python
 import hid
 import time
 
-# Send init to 0x36B0
-for d in hid.enumerate(0x36B0, 0x30A3):
+# Send init to 0x36B0 — prefer usage_page 0xFF60, then IF=1, then first
+devices = list(hid.enumerate(0x36B0, 0x30A3))
+target = None
+for d in devices:
     if d.get('usage_page') == 0xFF60:
-        dev = hid.device()
-        dev.open_path(d['path'])
-        dev.set_nonblocking(True)
-        dev.write(bytes([0xAA, 0xE2] + [0]*62))
-        time.sleep(0.05)
-        for _ in range(5):
-            dev.write(bytes([0xAA, 0xE0] + [0]*62))
-            time.sleep(0.05)
-        dev.close()
+        target = d
         break
+if target is None:
+    for d in devices:
+        if d.get('interface_number') == 1:
+            target = d
+            break
+if target is None and devices:
+    target = devices[0]
 
-time.sleep(0.5)
+if target:
+    dev = hid.device()
+    dev.open_path(target['path'])
+    dev.set_nonblocking(True)
+    dev.write(bytes([0xAA, 0xE2] + [0]*62))
+    time.sleep(0.05)
+    for _ in range(5):
+        dev.write(bytes([0xAA, 0xE0] + [0]*62))
+        time.sleep(0.05)
+    dev.close()
 
-# Now 0x1919 should appear
-for d in hid.enumerate(0x1919, 0x1919):
-    print(f"Found: 0x{d.get('usage_page', 0):04X}")
+# Poll for 0x1919 (may take 1-2s on Linux)
+for _ in range(10):
+    time.sleep(0.3)
+    found = list(hid.enumerate(0x1919, 0x1919))
+    if found:
+        for d in found:
+            print(f"Found: IF={d.get('interface_number')}  UP=0x{d.get('usage_page', 0):04X}")
+        break
+else:
+    print("0x1919 did not appear")
 ```
 
-3. **If still not working**: Unplug and replug the keyboard
+4. **If still not working**: Unplug and replug the keyboard
 
 ### Screen Stuck in "Downloading"
 
@@ -85,17 +119,21 @@ for d in hid.enumerate(0x1919, 0x1919):
 
 ## Device IDs
 
-| Device | VID | PID | Usage Page | Purpose |
-|--------|-----|-----|------------|---------|
-| Keyboard | 0x36B0 | 0x30A3 | 0xFF60 | Init commands |
-| LCD | 0x1919 | 0x1919 | 0xFF | Data transfer |
+| Device | VID | PID | Usage Page | Interface | Purpose |
+|--------|-----|-----|------------|-----------|---------|
+| Keyboard HID | 0x36B0 | 0x30A3 | 0x0001 | 0 | Standard keyboard |
+| **Raw HID** | 0x36B0 | 0x30A3 | **0xFF60** | **1** | **Init commands** |
+| Mouse/Consumer | 0x36B0 | 0x30A3 | 0x0001 | 2 | Media keys etc. |
+| LCD | 0x1919 | 0x1919 | 0xFF | 0,1 | Data transfer |
+
+**Note**: On Linux (libusb backend), `usage_page` is reported as `0x0000` for all interfaces. Use `interface_number` to distinguish them.
 
 ## Protocol Summary
 
-1. **Init** (on 0x36B0:0x30A3, UP=0xFF60):
+1. **Init** (on 0x36B0:0x30A3, IF=1, UP=0xFF60):
    - Send `AA E2` + `AA E0` ×5
-   - Wait 300ms
-   - 0x1919 device appears
+   - Poll for 0x1919 device (appears in ~300ms on macOS, ~1-2s on Linux)
+   - On Linux, `usage_page` may be 0; select interface by `interface_number == 1`
 
 2. **Download Mode** (on 0x1919:0x1919, UP=0xFF):
    - Query commands (`AA 10`, `AA 17`, etc.)
@@ -130,6 +168,7 @@ for d in hid.enumerate(0x1919, 0x1919):
 | `qgif.py` | QGIF encoder |
 | `hid_device.py` | USB HID communication |
 | `protocol.py` | Packet builders |
+| `udev/99-rt82.rules` | Linux udev rules for non-root HID access |
 | `PROTOCOL.md` | Full protocol documentation |
 | `QGIF.md` | QGIF format specification |
 
@@ -137,6 +176,8 @@ for d in hid.enumerate(0x1919, 0x1919):
 
 1. **Don't prepend Report ID** - Just send 64-byte packets directly
 2. **Two-step connection** - Must init 0x36B0 before 0x1919 appears
-3. **Little Endian** - All multi-byte values are LE
-4. **56-byte chunks** - Data packets have 8-byte header + 56 data
-5. **QGIF required** - Raw RGB565 usually doesn't display correctly
+3. **Correct interface on 0x36B0** - Init must go to IF=1 (raw HID, UP=0xFF60), not IF=0 (keyboard) or IF=2 (mouse). On Linux, `usage_page` is 0 so select by `interface_number == 1`
+4. **Poll for 0x1919** - USB re-enumeration takes ~1-2s on Linux; use a retry loop, not a fixed sleep
+5. **Little Endian** - All multi-byte values are LE
+6. **56-byte chunks** - Data packets have 8-byte header + 56 data
+7. **QGIF required** - Raw RGB565 usually doesn't display correctly

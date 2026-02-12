@@ -1,0 +1,16 @@
+# udev rules for Epomaker RT82 keyboard HID access (non-root)
+#
+# Install:
+#   sudo cp 99-rt82.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# Then unplug and replug the keyboard.
+
+# RT82 Keyboard interface (always visible) - VID:PID 36B0:30A3
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="36b0", ATTRS{idProduct}=="30a3", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="36b0", ATTRS{idProduct}=="30a3", MODE="0666"
+
+# RT82 LCD interface (appears after init) - VID:PID 1919:1919
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1919", ATTRS{idProduct}=="1919", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1919", ATTRS{idProduct}=="1919", MODE="0666"
