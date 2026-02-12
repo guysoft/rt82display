@@ -30,9 +30,28 @@ NATIVE_ENCODER = Path(__file__).parent.parent / "wasm2c_runtime" / "test_qgif"
 QGIF_SIZE_LIMIT = 65536  # 64KB
 
 
-def encode_gif_to_qgif(gif_path: Path, output_path: Path) -> bool:
+def gif_fps(gif_path: Path) -> int:
+    """Extract FPS from a GIF's first frame delay (matching the web tool's formula).
+    
+    GIF delays are in centiseconds (1/100s). We use the first frame's delay
+    and convert: fps = 1000 / delay_ms, clamped to 2-120.
+    Default is 20fps if no delay info is found.
+    """
+    with Image.open(gif_path) as gif:
+        delay_ms = gif.info.get('duration', 0)
+    if delay_ms <= 0:
+        return 20  # default, same as web tool
+    return max(2, min(120, round(1000 / delay_ms)))
+
+
+def encode_gif_to_qgif(gif_path: Path, output_path: Path, fps: int | None = None) -> bool:
     """
     Encode a GIF to QGIF using the native wasm2c encoder.
+    
+    Args:
+        gif_path: Path to the input GIF
+        output_path: Path for the output QGIF file
+        fps: Frames per second (2-120). If None, auto-detected from GIF.
     
     Returns True on success.
     """
@@ -43,6 +62,10 @@ def encode_gif_to_qgif(gif_path: Path, output_path: Path) -> bool:
             f"Native encoder not built. Run:\n"
             f"  cd {NATIVE_ENCODER.parent} && ./build.sh"
         )
+    
+    # Auto-detect fps from GIF if not provided
+    if fps is None:
+        fps = gif_fps(gif_path)
     
     # Load GIF frames
     with Image.open(gif_path) as gif:
@@ -69,8 +92,9 @@ def encode_gif_to_qgif(gif_path: Path, output_path: Path) -> bool:
         input_pattern = str(tmpdir / "input_X.png")
         output_str = str(output_path.absolute())
         
+        # Pass fps to native encoder (it auto-discovers frame count from files)
         result = subprocess.run(
-            [str(NATIVE_ENCODER), input_pattern, output_str, str(len(frames))],
+            [str(NATIVE_ENCODER), input_pattern, output_str, str(fps)],
             capture_output=True,
             text=True
         )
@@ -78,13 +102,14 @@ def encode_gif_to_qgif(gif_path: Path, output_path: Path) -> bool:
         return result.returncode == 0
 
 
-def encode_frames_to_qgif(frames: list[Image.Image], output_path: Path) -> bool:
+def encode_frames_to_qgif(frames: list[Image.Image], output_path: Path, fps: int = 20) -> bool:
     """
     Encode a list of PIL Image frames to QGIF using the native wasm2c encoder.
     
     Args:
         frames: List of PIL Image frames (will be resized to 240x136)
         output_path: Path for the output QGIF file
+        fps: Frames per second (2-120, default 20)
     
     Returns True on success.
     """
@@ -109,8 +134,9 @@ def encode_frames_to_qgif(frames: list[Image.Image], output_path: Path) -> bool:
         input_pattern = str(tmpdir / "input_X.png")
         output_str = str(output_path.absolute())
         
+        # Pass fps to native encoder (it auto-discovers frame count from files)
         result = subprocess.run(
-            [str(NATIVE_ENCODER), input_pattern, output_str, str(len(frames))],
+            [str(NATIVE_ENCODER), input_pattern, output_str, str(fps)],
             capture_output=True,
             text=True
         )
@@ -137,6 +163,9 @@ def compress_gif_to_fit(
     Returns:
         (qgif_data, frame_count, description) on success, or None if nothing works.
     """
+    # Get the original FPS from the GIF
+    original_fps = gif_fps(gif_path)
+    
     # Load all frames from the GIF
     with Image.open(gif_path) as gif:
         all_frames = []
@@ -164,6 +193,9 @@ def compress_gif_to_fit(
             selected = all_frames[::skip]
             kept = len(selected)
             
+            # When dropping frames, adjust fps to maintain original playback speed
+            effective_fps = max(2, min(120, round(original_fps / skip)))
+            
             # Apply posterization if needed
             if bits < 8:
                 processed = [ImageOps.posterize(f.convert('RGB'), bits).convert('RGBA')
@@ -176,7 +208,7 @@ def compress_gif_to_fit(
                 tmp_path = Path(tmp.name)
             
             try:
-                ok = encode_frames_to_qgif(processed, tmp_path)
+                ok = encode_frames_to_qgif(processed, tmp_path, fps=effective_fps)
                 if not ok:
                     continue
                 
@@ -227,7 +259,7 @@ def patch_qgif_header(qgif_path: Path) -> int:
     return len(data)
 
 
-def upload_to_device(data: bytes, frame_count: int = 1, fps: int = 8) -> bool:
+def upload_to_device(data: bytes, frame_count: int = 1) -> bool:
     """Upload data to RT82 using the two-step protocol.
     
     Returns True on success, raises Exception on failure.
@@ -431,8 +463,7 @@ def main():
 @main.command()
 @click.argument('file_path', type=click.Path(exists=True, path_type=Path))
 @click.option('--raw', is_flag=True, help='Send raw RGB565 (experimental, likely garbled)')
-@click.option('--fps', default=8, help='Frames per second (default: 8)')
-def upload(file_path: Path, raw: bool, fps: int):
+def upload(file_path: Path, raw: bool):
     """Upload a GIF or QGIF file to the RT82 display.
     
     FILE_PATH is the path to the file to upload.
@@ -482,9 +513,12 @@ def upload(file_path: Path, raw: bool, fps: int):
             error(f"Failed to load GIF: {e}")
             raise click.Abort()
         
+        # Auto-detect FPS from GIF frame delay (matches web tool behavior)
+        detected_fps = gif_fps(file_path)
+        
         muted(f"  📄 {file_path.name}")
         muted(f"  📐 {gif.width}x{gif.height} → 240x136")
-        muted(f"  🎞️  {gif.total_frames} frames")
+        muted(f"  🎞️  {gif.total_frames} frames @ {detected_fps} fps")
         
         # Check if native encoder is available
         if not NATIVE_ENCODER.exists():
@@ -501,9 +535,9 @@ def upload(file_path: Path, raw: bool, fps: int):
             tmp_path = Path(tmp.name)
         
         try:
-            muted("  ⚙️  Compressing with native encoder...")
+            muted(f"  ⚙️  Compressing with native encoder...")
             
-            if not encode_gif_to_qgif(file_path, tmp_path):
+            if not encode_gif_to_qgif(file_path, tmp_path, fps=detected_fps):
                 error("QGIF encoding failed")
                 raise click.Abort()
             
@@ -528,7 +562,7 @@ def upload(file_path: Path, raw: bool, fps: int):
     print_header("Uploading", "📤")
     
     try:
-        upload_to_device(data, frame_count=frame_count, fps=fps)
+        upload_to_device(data, frame_count=frame_count)
         console.print()
         success("Upload complete!")
             
@@ -638,14 +672,16 @@ def encode(gif_path: Path, output_path: Path):
         error(f"Failed to load GIF: {e}")
         raise click.Abort()
     
+    detected_fps = gif_fps(gif_path)
+    
     muted(f"  📄 {gif_path.name}")
     muted(f"  📐 {gif.width}x{gif.height} → 240x136")
-    muted(f"  🎞️  {gif.total_frames} frames")
+    muted(f"  🎞️  {gif.total_frames} frames @ {detected_fps} fps")
     
     muted("  ⚙️  Compressing...")
     
     try:
-        if not encode_gif_to_qgif(gif_path, output_path):
+        if not encode_gif_to_qgif(gif_path, output_path, fps=detected_fps):
             error("Encoding failed")
             raise click.Abort()
         

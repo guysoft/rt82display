@@ -12,18 +12,20 @@ extern void wasm_syscalls_free(struct w2c_a* ctx);
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        printf("Usage: %s <input_pattern> <output.qgif> <frame_count>\n", argv[0]);
-        printf("Example: %s /tmp/input_X.png /tmp/output.qgif 3\n", argv[0]);
+        printf("Usage: %s <input_pattern> <output.qgif> <fps>\n", argv[0]);
+        printf("Example: %s /tmp/input_X.png /tmp/output.qgif 20\n", argv[0]);
+        printf("\nThe encoder auto-discovers frames from the input pattern.\n");
+        printf("fps = frames per second (2-120, matches GIF frame rate).\n");
         return 1;
     }
     
     const char* input_pattern = argv[1];
     const char* output_path = argv[2];
-    int frame_count = atoi(argv[3]);
+    int fps = atoi(argv[3]);
     
     printf("Input pattern: %s\n", input_pattern);
     printf("Output: %s\n", output_path);
-    printf("Frames: %d\n", frame_count);
+    printf("FPS: %d\n", fps);
     
     /* Initialize wasm-rt */
     wasm_rt_init();
@@ -57,9 +59,13 @@ int main(int argc, char** argv) {
     u32 output_ptr = w2c_qgif_l(&qgif, output_len);
     memcpy(mem->data + output_ptr, output_path, output_len);
     
-    /* Call compress_video_wasm (export 'm') */
+    /* Call compress_video_wasm (export 'm')
+     * Parameters match the web tool's JS call:
+     *   compress_video_wasm(input_pattern, output_path, flag=0, fps)
+     * The 3rd param (flag) is always 0. The 4th param is FPS.
+     * The encoder discovers frame count automatically from files. */
     printf("Calling compress_video_wasm...\n");
-    u32 result = w2c_qgif_m(&qgif, input_ptr, output_ptr, 0, frame_count);
+    u32 result = w2c_qgif_m(&qgif, input_ptr, output_ptr, 0, fps);
     
     if (result == 0) {
         printf("✅ Success!\n");
