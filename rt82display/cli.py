@@ -21,7 +21,7 @@ from .image import load_gif, ProcessedGif, DISPLAY_WIDTH, DISPLAY_HEIGHT
 from .hid_device import find_devices
 from .protocol import QGIF_MAGIC, is_qgif_data
 
-__version__ = "0.1.0"
+__version__ = "0.5.1"
 
 def _find_native_encoder() -> Path | None:
     """Locate the native QGIF encoder binary.

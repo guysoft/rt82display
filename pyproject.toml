@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rt82display"
-version = "0.1.0"
+version = "0.5.1"
 description = "CLI tool to upload GIFs to Epomaker RT82 keyboard LCD screen"
 readme = "README.md"
 requires-python = ">=3.10"
