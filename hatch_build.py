@@ -20,6 +20,30 @@ C_SOURCES = [
     "test_qgif.c",
 ]
 
+_VSWHERE = Path(
+    r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+)
+
+
+def _msvc_env():
+    """Discover MSVC via vswhere and return an env dict with cl.exe on PATH."""
+    result = subprocess.run(
+        [str(_VSWHERE), "-latest", "-property", "installationPath"],
+        capture_output=True, text=True, check=True,
+    )
+    vs_path = result.stdout.strip()
+    vcvarsall = Path(vs_path) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+    result = subprocess.run(
+        f'call "{vcvarsall}" amd64 && set',
+        capture_output=True, text=True, shell=True, check=True,
+    )
+    env = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            env[key] = value
+    return env
+
 
 class CustomBuildHook(BuildHookInterface):
     def initialize(self, version, build_data):
@@ -38,8 +62,10 @@ class CustomBuildHook(BuildHookInterface):
         output = bin_dir / binary_name
 
         sources = [str(src_dir / f) for f in C_SOURCES]
+        env = None
 
         if sys.platform == "win32":
+            env = _msvc_env()
             cmd = [
                 "cl.exe", "/O2", "/DNDEBUG",
                 "/DWASM_RT_MEMCHECK_BOUNDS_CHECK=1",
@@ -58,7 +84,7 @@ class CustomBuildHook(BuildHookInterface):
                 cmd += archflags.split()
             cmd += [*sources, "-lm", "-o", str(output)]
 
-        subprocess.check_call(cmd)
+        subprocess.check_call(cmd, env=env)
 
         if sys.platform != "win32":
             output.chmod(0o755)
