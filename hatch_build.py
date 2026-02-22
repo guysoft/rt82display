@@ -20,29 +20,23 @@ C_SOURCES = [
     "test_qgif.c",
 ]
 
-_VSWHERE = Path(
-    r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-)
 
-
-def _msvc_env():
-    """Discover MSVC via vswhere and return an env dict with cl.exe on PATH."""
+def _find_vcvarsall():
+    """Use vswhere.exe to locate vcvarsall.bat."""
+    vswhere = Path(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    )
+    if not vswhere.exists():
+        raise FileNotFoundError(f"vswhere not found at {vswhere}")
     result = subprocess.run(
-        [str(_VSWHERE), "-latest", "-property", "installationPath"],
+        [str(vswhere), "-latest", "-property", "installationPath"],
         capture_output=True, text=True, check=True,
     )
     vs_path = result.stdout.strip()
     vcvarsall = Path(vs_path) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
-    result = subprocess.run(
-        f'call "{vcvarsall}" amd64 && set',
-        capture_output=True, text=True, shell=True, check=True,
-    )
-    env = {}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            key, _, value = line.partition("=")
-            env[key] = value
-    return env
+    if not vcvarsall.exists():
+        raise FileNotFoundError(f"vcvarsall.bat not found at {vcvarsall}")
+    return vcvarsall
 
 
 class CustomBuildHook(BuildHookInterface):
@@ -62,17 +56,17 @@ class CustomBuildHook(BuildHookInterface):
         output = bin_dir / binary_name
 
         sources = [str(src_dir / f) for f in C_SOURCES]
-        env = None
 
         if sys.platform == "win32":
-            env = _msvc_env()
-            cmd = [
-                "cl.exe", "/O2", "/DNDEBUG",
-                "/DWASM_RT_MEMCHECK_BOUNDS_CHECK=1",
-                f"/I{src_dir}",
-                *sources,
-                f"/Fe:{output}",
-            ]
+            vcvarsall = _find_vcvarsall()
+            src_args = " ".join(f'"{s}"' for s in sources)
+            shell_cmd = (
+                f'call "{vcvarsall}" amd64 && '
+                f"cl.exe /O2 /DNDEBUG "
+                f"/DWASM_RT_MEMCHECK_BOUNDS_CHECK=1 "
+                f'/I"{src_dir}" {src_args} /Fe:"{output}"'
+            )
+            subprocess.check_call(shell_cmd, shell=True)
         else:
             cmd = [
                 "cc", "-O2", "-DNDEBUG",
@@ -83,10 +77,7 @@ class CustomBuildHook(BuildHookInterface):
             if archflags:
                 cmd += archflags.split()
             cmd += [*sources, "-lm", "-o", str(output)]
-
-        subprocess.check_call(cmd, env=env)
-
-        if sys.platform != "win32":
+            subprocess.check_call(cmd)
             output.chmod(0o755)
 
         build_data["force_include"][str(output)] = f"rt82display/_bin/{binary_name}"
