@@ -4,52 +4,52 @@ Upload GIFs to your Epomaker RT82 keyboard's LCD screen from the command line.
 
 ## Installation
 
-### Prerequisites
-
-**All platforms:**
-- Python 3.10+
-- A C compiler (gcc/clang) for the native QGIF encoder
-
-**Linux (Debian/Ubuntu):**
-
-Install system libraries needed by the `hidapi` Python package:
+### Install from PyPI
 
 ```bash
-sudo apt install libusb-1.0-0-dev libudev-dev python3-dev
+pip install rt82display
 ```
 
-Set up udev rules so the tool can access the keyboard without root:
+This installs the CLI tool and all Python dependencies. You can immediately
+use `rt82display list`, `rt82display info`, and upload pre-encoded `.qgif` files.
+
+### Linux: udev rules (required for non-root access)
 
 ```bash
-sudo cp udev/99-rt82.rules /etc/udev/rules.d/
+# Download the rules file from the repo
+sudo curl -o /etc/udev/rules.d/99-rt82.rules \
+  https://raw.githubusercontent.com/guysoft/rt82display/main/udev/99-rt82.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
 Then unplug and replug the keyboard.
 
-**macOS:** No extra system dependencies required.
+**macOS:** No extra setup required.
 
-### 1. Install Python package
+### Optional: Build the native QGIF encoder
 
-```bash
-cd rt82display
-pip install -e .
-# or: uv pip install -e .
-```
-
-### 2. Build the native QGIF encoder
-
-The QGIF encoder is compiled from WebAssembly (the same code as the official web tool):
+The native encoder is needed to upload `.gif` files directly (auto-converts
+GIF to QGIF). Without it you can still upload pre-encoded `.qgif` files.
 
 ```bash
-cd wasm2c_runtime
+git clone https://github.com/guysoft/rt82display.git
+cd rt82display/wasm2c_runtime
 ./build.sh
 ```
 
-**Requirements:**
-- C compiler (gcc/clang)
-- WABT runtime headers (included in `wasm2c_runtime/`)
+**Requirements:** A C compiler (gcc/clang). The WABT runtime headers are
+included in the repository.
+
+### Development install
+
+To install from a local checkout instead of PyPI:
+
+```bash
+git clone https://github.com/guysoft/rt82display.git
+cd rt82display
+pip install -e .
+```
 
 ## Usage
 
