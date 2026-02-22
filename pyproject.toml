@@ -46,5 +46,18 @@ source = "vcs"
 [tool.hatch.build.hooks.vcs]
 version-file = "rt82display/_version.py"
 
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "rt82display/",
+    "wasm2c_runtime/*.c",
+    "wasm2c_runtime/*.h",
+    "hatch_build.py",
+    "README.md",
+    "LICENSE*",
+    "pyproject.toml",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["rt82display"]

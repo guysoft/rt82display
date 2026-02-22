@@ -26,13 +26,24 @@ def _find_native_encoder() -> Path | None:
     """Locate the native QGIF encoder binary.
 
     Search order:
-      1. Adjacent to the source tree (dev / editable install)
-      2. On $PATH (user built it and added to PATH)
+      1. Bundled in the installed package (pip wheel with prebuilt binary)
+      2. Adjacent to the source tree (dev / editable install)
+      3. On $PATH (user built it and added to PATH)
     """
     import shutil
-    dev_path = Path(__file__).parent.parent / "wasm2c_runtime" / "test_qgif"
+    import sys
+
+    ext = ".exe" if sys.platform == "win32" else ""
+    name = f"test_qgif{ext}"
+
+    pkg_bin = Path(__file__).parent / "_bin" / name
+    if pkg_bin.exists():
+        return pkg_bin
+
+    dev_path = Path(__file__).parent.parent / "wasm2c_runtime" / name
     if dev_path.exists():
         return dev_path
+
     found = shutil.which("test_qgif")
     if found:
         return Path(found)

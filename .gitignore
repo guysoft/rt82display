@@ -32,6 +32,9 @@ htmlcov/
 # Auto-generated version file (hatch-vcs)
 _version.py
 
+# Compiled native encoder (built by hatch_build.py during wheel creation)
+rt82display/_bin/
+
 # Environment
 .env
 .envrc
