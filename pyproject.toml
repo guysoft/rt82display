@@ -37,6 +37,8 @@ rt82display = "rt82display.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/guysoft/rt82display"
+Repository = "https://github.com/guysoft/rt82display"
+"Bug Tracker" = "https://github.com/guysoft/rt82display/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rt82display"]
