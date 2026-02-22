@@ -41,7 +41,7 @@ jobs:
         with:
           platforms: arm64
 
-      - uses: pypa/cibuildwheel@v2
+      - uses: pypa/cibuildwheel@v3.3
         env:
           CIBW_BUILD: "cp312-*"
           CIBW_ARCHS_LINUX: "x86_64 aarch64"
