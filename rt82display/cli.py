@@ -23,8 +23,23 @@ from .protocol import QGIF_MAGIC, is_qgif_data
 
 __version__ = "0.1.0"
 
-# Path to native encoder
-NATIVE_ENCODER = Path(__file__).parent.parent / "wasm2c_runtime" / "test_qgif"
+def _find_native_encoder() -> Path | None:
+    """Locate the native QGIF encoder binary.
+
+    Search order:
+      1. Adjacent to the source tree (dev / editable install)
+      2. On $PATH (user built it and added to PATH)
+    """
+    import shutil
+    dev_path = Path(__file__).parent.parent / "wasm2c_runtime" / "test_qgif"
+    if dev_path.exists():
+        return dev_path
+    found = shutil.which("test_qgif")
+    if found:
+        return Path(found)
+    return None
+
+NATIVE_ENCODER = _find_native_encoder()
 
 # Default QGIF compression target (used by compress_gif_to_fit)
 QGIF_SIZE_LIMIT = 65536  # 64KB
@@ -57,10 +72,12 @@ def encode_gif_to_qgif(gif_path: Path, output_path: Path, fps: int | None = None
     """
     WIDTH, HEIGHT = 240, 136  # Must be divisible by 4
     
-    if not NATIVE_ENCODER.exists():
+    if NATIVE_ENCODER is None:
         raise FileNotFoundError(
-            f"Native encoder not built. Run:\n"
-            f"  cd {NATIVE_ENCODER.parent} && ./build.sh"
+            "Native QGIF encoder not found.\n"
+            "  Build it:  git clone https://github.com/guysoft/rt82display && "
+            "cd rt82display/wasm2c_runtime && ./build.sh\n"
+            "  Then either add it to PATH or run from the repo directory."
         )
     
     # Auto-detect fps from GIF if not provided
@@ -115,10 +132,12 @@ def encode_frames_to_qgif(frames: list[Image.Image], output_path: Path, fps: int
     """
     WIDTH, HEIGHT = 240, 136  # Must be divisible by 4
     
-    if not NATIVE_ENCODER.exists():
+    if NATIVE_ENCODER is None:
         raise FileNotFoundError(
-            f"Native encoder not built. Run:\n"
-            f"  cd {NATIVE_ENCODER.parent} && ./build.sh"
+            "Native QGIF encoder not found.\n"
+            "  Build it:  git clone https://github.com/guysoft/rt82display && "
+            "cd rt82display/wasm2c_runtime && ./build.sh\n"
+            "  Then either add it to PATH or run from the repo directory."
         )
     
     if not frames:
@@ -521,10 +540,13 @@ def upload(file_path: Path, raw: bool):
         muted(f"  🎞️  {gif.total_frames} frames @ {detected_fps} fps")
         
         # Check if native encoder is available
-        if not NATIVE_ENCODER.exists():
+        if NATIVE_ENCODER is None:
             console.print()
-            warning("Native QGIF encoder not built!")
-            muted(f"  Build it with: cd {NATIVE_ENCODER.parent} && ./build.sh")
+            warning("Native QGIF encoder not found!")
+            muted("  To upload GIFs directly, build the encoder:")
+            muted("    git clone https://github.com/guysoft/rt82display")
+            muted("    cd rt82display/wasm2c_runtime && ./build.sh")
+            muted("  Then add wasm2c_runtime/ to your PATH, or run from the repo.")
             console.print()
             muted("  Alternative: use the web tool https://image.rdmctmzt.com/")
             muted("  to create a .qgif file, then upload that.")
@@ -661,9 +683,11 @@ def encode(gif_path: Path, output_path: Path):
     print_header("Encoding to QGIF", "🎬")
     
     # Check native encoder
-    if not NATIVE_ENCODER.exists():
-        error("Native encoder not built!")
-        muted(f"  Run: cd {NATIVE_ENCODER.parent} && ./build.sh")
+    if NATIVE_ENCODER is None:
+        error("Native QGIF encoder not found!")
+        muted("  Build it:  git clone https://github.com/guysoft/rt82display")
+        muted("             cd rt82display/wasm2c_runtime && ./build.sh")
+        muted("  Then add wasm2c_runtime/ to your PATH, or run from the repo.")
         raise click.Abort()
     
     try:
