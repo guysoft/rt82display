@@ -29,6 +29,9 @@ htmlcov/
 .tox/
 .mypy_cache/
 
+# Auto-generated version file (hatch-vcs)
+_version.py
+
 # Environment
 .env
 .envrc

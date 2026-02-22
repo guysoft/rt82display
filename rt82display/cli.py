@@ -17,11 +17,10 @@ from .theme import (
     console, success, error, warning, info, muted,
     print_header, print_banner, step_progress, format_bytes
 )
+from . import __version__
 from .image import load_gif, ProcessedGif, DISPLAY_WIDTH, DISPLAY_HEIGHT
 from .hid_device import find_devices
 from .protocol import QGIF_MAGIC, is_qgif_data
-
-__version__ = "0.5.1"
 
 def _find_native_encoder() -> Path | None:
     """Locate the native QGIF encoder binary.

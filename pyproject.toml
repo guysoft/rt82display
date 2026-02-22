@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "rt82display"
-version = "0.5.1"
+dynamic = ["version"]
 description = "CLI tool to upload GIFs to Epomaker RT82 keyboard LCD screen"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,6 +39,12 @@ rt82display = "rt82display.cli:main"
 Homepage = "https://github.com/guysoft/rt82display"
 Repository = "https://github.com/guysoft/rt82display"
 "Bug Tracker" = "https://github.com/guysoft/rt82display/issues"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "rt82display/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rt82display"]
