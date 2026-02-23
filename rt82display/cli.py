@@ -3,7 +3,10 @@
 Upload GIFs to your Epomaker RT82 keyboard's LCD screen.
 """
 
+import contextlib
+import fcntl
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import time
@@ -21,6 +24,45 @@ from . import __version__
 from .image import load_gif, ProcessedGif, DISPLAY_WIDTH, DISPLAY_HEIGHT
 from .hid_device import find_devices
 from .protocol import QGIF_MAGIC, is_qgif_data
+
+# ---------------------------------------------------------------------------
+# Device lock – prevents two processes from talking to the HID device at once
+# ---------------------------------------------------------------------------
+
+LOCK_PATH = Path(tempfile.gettempdir()) / "rt82display.lock"
+UPLOAD_TIMEOUT = 120  # seconds; 0 disables the alarm
+
+
+class DeviceBusy(Exception):
+    """Raised when another process is already using the RT82 device."""
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError(
+        "Upload timed out – the device may be unresponsive. "
+        "Try unplugging and re-plugging the keyboard."
+    )
+
+
+@contextlib.contextmanager
+def rt82_device_lock():
+    """Acquire an exclusive file lock so only one upload runs at a time."""
+    lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fd.close()
+        raise DeviceBusy(
+            "Another rt82display process is already uploading. "
+            "If a service is running, wait for it to finish or stop it with: "
+            "launchctl unload ~/Library/LaunchAgents/com.rt82weather.update.plist"
+        )
+    try:
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
 
 def _find_native_encoder() -> Path | None:
     """Locate the native QGIF encoder binary.
@@ -291,8 +333,24 @@ def patch_qgif_header(qgif_path: Path) -> int:
 def upload_to_device(data: bytes, frame_count: int = 1) -> bool:
     """Upload data to RT82 using the two-step protocol.
     
+    Acquires an exclusive file lock so two processes (e.g. the launchd
+    service and a manual invocation) cannot upload simultaneously.
+    
     Returns True on success, raises Exception on failure.
     """
+    with rt82_device_lock():
+        old_alarm = signal.signal(signal.SIGALRM, _timeout_handler)
+        if UPLOAD_TIMEOUT:
+            signal.alarm(UPLOAD_TIMEOUT)
+        try:
+            return _upload_to_device_locked(data, frame_count)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_alarm)
+
+
+def _upload_to_device_locked(data: bytes, frame_count: int = 1) -> bool:
+    """Inner upload logic – must be called while holding rt82_device_lock."""
     file_size = len(data)
     
     def send(dev, pkt, delay=0.02):
@@ -312,7 +370,6 @@ def upload_to_device(data: bytes, frame_count: int = 1) -> bool:
         padded = pkt + [0] * (64 - len(pkt))
         packet = bytes([0x00] + padded)  # 65 bytes: report ID 0x00 + data
         result = dev.write(packet)
-        # Read response for flow control (like the web tool does)
         try:
             resp = dev.read(64, timeout_ms=500)
         except Exception:
