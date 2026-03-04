@@ -4,7 +4,9 @@ Upload GIFs to your Epomaker RT82 keyboard's LCD screen.
 """
 
 import contextlib
+import datetime
 import fcntl
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -23,6 +25,7 @@ from .theme import (
 from . import __version__
 from .image import load_gif, ProcessedGif, DISPLAY_WIDTH, DISPLAY_HEIGHT
 from .hid_device import find_devices
+from .hid_writer import HIDWriter
 from .protocol import QGIF_MAGIC, is_qgif_data
 
 # ---------------------------------------------------------------------------
@@ -330,12 +333,251 @@ def patch_qgif_header(qgif_path: Path) -> int:
     return len(data)
 
 
+def _find_lcd_path() -> bytes | None:
+    """Return the HID device path for the 0x1919 LCD, or None.
+
+    Prefer usage_page 0xFF (macOS); fall back to IF=1 then first (Linux).
+    On Linux (libusb backend), usage_page is 0 for all interfaces.
+    """
+    lcd_devices = list(hid.enumerate(0x1919, 0x1919))
+    for d in lcd_devices:
+        if d.get("usage_page") == 0xFF:
+            return d["path"]
+    for d in lcd_devices:
+        if d.get("interface_number") == 1:
+            return d["path"]
+    if lcd_devices:
+        return lcd_devices[0]["path"]
+    return None
+
+
+def _open_kbd_device() -> hid.device:
+    """Find and open the 0x36B0 keyboard raw-HID interface.
+
+    On macOS usage_page is reported correctly, so we match 0xFF60.
+    On Linux (libusb backend) usage_page is 0 for all interfaces, so
+    we fall back to interface_number == 1 (the standard QMK raw HID
+    interface).
+
+    Raises ConnectionError if not found.
+    """
+    kbd_devices = list(hid.enumerate(0x36B0, 0x30A3))
+    target_kbd = None
+    # Priority 1: exact usage_page match
+    for d in kbd_devices:
+        if d.get("usage_page") == 0xFF60:
+            target_kbd = d
+            break
+    # Priority 2: interface 1 (QMK raw HID convention)
+    if target_kbd is None:
+        for d in kbd_devices:
+            if d.get("interface_number") == 1:
+                target_kbd = d
+                break
+    # Priority 3: any device with this VID:PID
+    if target_kbd is None and kbd_devices:
+        target_kbd = kbd_devices[0]
+    if target_kbd is None:
+        raise ConnectionError("Could not find keyboard interface (0x36B0)")
+    dev = hid.device()
+    dev.open_path(target_kbd["path"])
+    dev.set_nonblocking(True)
+    return dev
+
+
+def _send_kbd(dev, pkt, delay=0.02):
+    """Send a 64-byte packet on the 0x36B0 keyboard device."""
+    packet = bytes(pkt + [0] * (64 - len(pkt)))
+    result = dev.write(packet)
+    time.sleep(delay)
+    return result >= 0
+
+
+def _find_usb_sysfs_path(vid: int, pid: int) -> str | None:
+    """Find the sysfs device path for a USB device by VID:PID."""
+    usb_devices = "/sys/bus/usb/devices"
+    try:
+        for entry in os.listdir(usb_devices):
+            dev_dir = os.path.join(usb_devices, entry)
+            try:
+                with open(os.path.join(dev_dir, "idVendor")) as f:
+                    dev_vid = f.read().strip()
+                with open(os.path.join(dev_dir, "idProduct")) as f:
+                    dev_pid = f.read().strip()
+                if dev_vid == f"{vid:04x}" and dev_pid == f"{pid:04x}":
+                    return entry
+            except (FileNotFoundError, PermissionError):
+                continue
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _usb_reset_device(sysfs_name: str) -> bool:
+    """Reset a USB device by unbinding and rebinding its driver.
+
+    This is equivalent to physically unplugging and replugging.
+    Works even when the device is stuck (kernel state D on URB wait)
+    because unbind operates on the driver binding, not the device I/O.
+
+    Returns True on success.
+    """
+    unbind = "/sys/bus/usb/drivers/usb/unbind"
+    bind = "/sys/bus/usb/drivers/usb/bind"
+    try:
+        with open(unbind, "w") as f:
+            f.write(sysfs_name)
+        time.sleep(1.0)
+        with open(bind, "w") as f:
+            f.write(sysfs_name)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+
+
+def _try_reset_lcd(lcd_path: bytes) -> bool:
+    """Try to reset a stuck LCD by sending End + Start via a short-lived worker.
+
+    If the device is responsive, this sends the protocol-level reset
+    commands.  If the write blocks (device stuck), the worker is
+    abandoned and we return False.
+    """
+    writer = None
+    try:
+        writer = HIDWriter(lcd_path)
+        writer.send65([0xAA, 0x1A], write_timeout_s=2.0)  # End
+        writer.send65([0xAA, 0x11], write_timeout_s=2.0)  # Start
+        return True
+    except (TimeoutError, Exception):
+        return False
+    finally:
+        if writer is not None:
+            writer.kill()
+
+
+def _kill_stuck_rt82_processes() -> bool:
+    """Find and kill any stuck rt82weather/rt82display upload processes.
+
+    Uses /proc on Linux to avoid a psutil dependency.  Returns True if
+    any process was signalled.  Note: processes stuck in kernel state D
+    (uninterruptible USB sleep) won't actually die until the USB
+    transfer completes or the device is reset.
+    """
+    my_pid = os.getpid()
+    killed_any = False
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == my_pid:
+            continue
+        try:
+            cmdline_path = f"/proc/{pid}/cmdline"
+            with open(cmdline_path, "rb") as f:
+                raw = f.read()
+            cmdline = raw.replace(b"\x00", b" ").decode(
+                "utf-8", errors="replace"
+            )
+            if "rt82" in cmdline and (
+                "upload" in cmdline or "update" in cmdline
+            ):
+                muted(
+                    f"  Killing stuck process {pid} "
+                    f"({cmdline.strip()[:60]})"
+                )
+                os.kill(pid, signal.SIGKILL)
+                killed_any = True
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+
+    return killed_any
+
+
+def reset_display() -> bool:
+    """Software-reset the RT82 display without unplugging.
+
+    Strategy:
+      1. Kill any stuck upload/update processes.
+      2. Try protocol-level reset (End + Start) on the LCD device.
+         If the device is stuck in kernel state D this will time out
+         quickly without blocking the caller.
+      3. If protocol reset fails, try USB unbind/rebind (requires write
+         access to sysfs — works with appropriate udev rules).
+      4. Re-init via the keyboard device.
+
+    Returns True on success.
+    """
+    _kill_stuck_rt82_processes()
+
+    lcd_path = _find_lcd_path()
+    if lcd_path:
+        muted("  LCD device found, attempting protocol reset...")
+        if _try_reset_lcd(lcd_path):
+            muted("  Protocol reset succeeded")
+        else:
+            warning(
+                "  Protocol reset failed (device unresponsive) "
+                "— trying USB reset..."
+            )
+            sysfs = _find_usb_sysfs_path(0x1919, 0x1919)
+            if sysfs and _usb_reset_device(sysfs):
+                muted("  USB reset succeeded")
+                time.sleep(2.0)
+            else:
+                warning(
+                    "  USB reset not available (needs permission). "
+                    "Unplug and replug the keyboard."
+                )
+                return False
+
+    try:
+        dev36 = _open_kbd_device()
+        _send_kbd(dev36, [0xAA, 0xE2])
+        for _ in range(5):
+            _send_kbd(dev36, [0xAA, 0xE0])
+        dev36.close()
+        muted("  Keyboard re-initialized")
+    except ConnectionError:
+        pass
+
+    return True
+
+
+def _send65_retry(
+    writer: HIDWriter,
+    pkt: list[int],
+    max_retries: int = 3,
+    write_timeout: float = 3.0,
+) -> tuple[bool, list | None]:
+    """Send a packet via the HIDWriter, retrying on timeout.
+
+    On timeout the worker is killed and respawned (reopening the device).
+    """
+    for attempt in range(max_retries):
+        try:
+            return writer.send65(pkt, write_timeout_s=write_timeout)
+        except TimeoutError:
+            if attempt < max_retries - 1:
+                warning(
+                    f"  Write timeout, restarting connection "
+                    f"({attempt + 2}/{max_retries})..."
+                )
+                writer.restart()
+                time.sleep(0.5 * (attempt + 1))
+            else:
+                raise
+    raise TimeoutError("HID write failed after all retries")
+
+
 def upload_to_device(data: bytes, frame_count: int = 1) -> bool:
     """Upload data to RT82 using the two-step protocol.
-    
+
     Acquires an exclusive file lock so two processes (e.g. the launchd
     service and a manual invocation) cannot upload simultaneously.
-    
+
     Returns True on success, raises Exception on failure.
     """
     with rt82_device_lock():
@@ -350,193 +592,222 @@ def upload_to_device(data: bytes, frame_count: int = 1) -> bool:
 
 
 def _upload_to_device_locked(data: bytes, frame_count: int = 1) -> bool:
-    """Inner upload logic – must be called while holding rt82_device_lock."""
+    """Inner upload logic — must be called while holding rt82_device_lock.
+
+    Uses a worker process for all LCD (0x1919) I/O so that a blocked
+    ``hid_write()`` can be killed and retried without hanging the caller.
+    """
     file_size = len(data)
-    
-    def send(dev, pkt, delay=0.02):
-        packet = bytes(pkt + [0] * (64 - len(pkt)))
-        result = dev.write(packet)
-        time.sleep(delay)
-        return result >= 0
-    
-    def send65(dev, pkt, delay=0.0):
-        """Send a 65-byte packet (report ID 0x00 prefix) to the 0x1919 device.
-        
-        The web tool sends 65-byte HID reports:
-          - byte[0] = 0x00 (report ID)
-          - bytes[1..64] = packet data (0xAA command + payload)
-        And reads a response after every write for flow control.
-        """
-        padded = pkt + [0] * (64 - len(pkt))
-        packet = bytes([0x00] + padded)  # 65 bytes: report ID 0x00 + data
-        result = dev.write(packet)
-        try:
-            resp = dev.read(64, timeout_ms=500)
-        except Exception:
-            resp = None
-        if delay > 0:
-            time.sleep(delay)
-        return result >= 0
-    
-    # Step 1: Init on 36B0 to activate 1919 device
-    info("Initializing display...")
-    dev36 = None
-    # Enumerate all 0x36B0:0x30A3 devices and pick the raw HID interface.
-    # On macOS: usage_page is reported correctly, so we match 0xFF60.
-    # On Linux (libusb backend): usage_page is 0 for all interfaces, so we
-    # fall back to interface_number == 1 (the standard QMK raw HID interface).
-    kbd_devices = list(hid.enumerate(0x36B0, 0x30A3))
-    target_kbd = None
-    # Priority 1: exact usage_page match
-    for d in kbd_devices:
-        if d.get('usage_page') == 0xFF60:
-            target_kbd = d
-            break
-    # Priority 2: interface 1 (QMK raw HID convention) when usage_page unknown
-    if target_kbd is None:
-        for d in kbd_devices:
-            if d.get('interface_number') == 1:
-                target_kbd = d
-                break
-    # Priority 3: any device with this VID:PID
-    if target_kbd is None and kbd_devices:
-        target_kbd = kbd_devices[0]
-    if target_kbd is not None:
-        dev36 = hid.device()
-        dev36.open_path(target_kbd['path'])
-        dev36.set_nonblocking(True)
-    
-    if not dev36:
-        raise ConnectionError("Could not find keyboard interface (0x36B0)")
-    
-    send(dev36, [0xAA, 0xE2])
-    for _ in range(5):
-        send(dev36, [0xAA, 0xE0])
-    # Keep dev36 open - we need it later for AA E3
-    
-    # Step 2: Wait for 0x1919 LCD device to appear.
-    # On macOS this is near-instant (~300ms), but on Linux the USB re-enumeration
-    # through the libusb backend can take 1-2 seconds. Poll with retries.
-    dev = None
-    target_lcd = None
-    for attempt in range(10):
-        time.sleep(0.3)
-        lcd_devices = list(hid.enumerate(0x1919, 0x1919))
-        # Prefer usage_page 0xFF (macOS); fall back to IF=1 then first (Linux).
-        for d in lcd_devices:
-            if d.get('usage_page') == 0xFF:
-                target_lcd = d
-                break
-        if target_lcd is None:
-            for d in lcd_devices:
-                if d.get('interface_number') == 1:
-                    target_lcd = d
-                    break
-        if target_lcd is None and lcd_devices:
-            target_lcd = lcd_devices[0]
-        if target_lcd is not None:
-            break
-    
-    if target_lcd is not None:
-        dev = hid.device()
-        dev.open_path(target_lcd['path'])
-        dev.set_nonblocking(False)  # Blocking reads for flow control
-    
-    if not dev:
-        dev36.close()
-        raise ConnectionError("LCD interface (0x1919) did not appear after init")
-    
+    writer: HIDWriter | None = None
+    dev36: hid.device | None = None
+
+    # ------------------------------------------------------------------
+    # Recovery preamble: if the LCD device is already present from a
+    # previous stuck session, try to reset it before starting fresh.
+    # ------------------------------------------------------------------
+    stale_lcd = _find_lcd_path()
+    if stale_lcd:
+        warning("  LCD device already present — cleaning up stale session...")
+        if _try_reset_lcd(stale_lcd):
+            muted("  Protocol reset succeeded")
+            time.sleep(0.5)
+        else:
+            warning("  Protocol reset failed, trying USB reset...")
+            sysfs = _find_usb_sysfs_path(0x1919, 0x1919)
+            if sysfs and _usb_reset_device(sysfs):
+                muted("  USB reset succeeded")
+                time.sleep(2.0)
+            elif _find_lcd_path() is not None:
+                raise ConnectionError(
+                    "LCD device is stuck from a previous session and "
+                    "could not be reset.\n"
+                    "  Please unplug and replug the keyboard, then retry."
+                )
+
     try:
+        # --------------------------------------------------------------
+        # Step 1: Init on 0x36B0 to activate the 0x1919 LCD device
+        # --------------------------------------------------------------
+        info("Initializing display...")
+        dev36 = _open_kbd_device()
+
+        _send_kbd(dev36, [0xAA, 0xE2])
+        for _ in range(5):
+            _send_kbd(dev36, [0xAA, 0xE0])
+
+        # --------------------------------------------------------------
+        # Step 2: Wait for 0x1919 LCD device to appear.
+        # On macOS this is near-instant (~300ms), but on Linux the USB
+        # re-enumeration through the libusb backend can take 1-2 s.
+        # --------------------------------------------------------------
+        lcd_path = None
+        for _attempt in range(10):
+            time.sleep(0.3)
+            lcd_path = _find_lcd_path()
+            if lcd_path is not None:
+                break
+
+        if lcd_path is None:
+            raise ConnectionError(
+                "LCD interface (0x1919) did not appear after init"
+            )
+
+        # --------------------------------------------------------------
+        # Step 3: Open the LCD device via a killable worker process
+        # --------------------------------------------------------------
+        writer = HIDWriter(lcd_path)
+
         # LCD init sequence on 0x1919
         muted("  Entering download mode...")
-        send65(dev, [0xAA, 0x10])
-        send65(dev, [0xAA, 0x17, 0,0,0,0x38,0,0, 2,0,2,6,0,2,3,0,4,0,9,1])
-        send65(dev, [0xAA, 0x11])
-        send65(dev, [0xAA, 0x1C])
-        send65(dev, [0xAA, 0x10])
-        send65(dev, [0xAA, 0x12, 0,0,0,0x38])
-        send65(dev, [0xAA, 0x11])
-        send65(dev, [0xAA, 0x1C])
-        
+        writer.send65([0xAA, 0x10])
+        writer.send65(
+            [0xAA, 0x17, 0, 0, 0, 0x38, 0, 0,
+             2, 0, 2, 6, 0, 2, 3, 0, 4, 0, 9, 1]
+        )
+        writer.send65([0xAA, 0x11])
+        writer.send65([0xAA, 0x1C])
+        writer.send65([0xAA, 0x10])
+        writer.send65([0xAA, 0x12, 0, 0, 0, 0x38])
+        writer.send65([0xAA, 0x11])
+        writer.send65([0xAA, 0x1C])
+
         # Send AA E3 (getGifCount) on KEYBOARD device (0x36B0).
         # The web tool sends this on the keyboard's 32-byte interface,
         # with both devices open, right before starting the transfer.
-        send(dev36, [0xAA, 0xE3, 0,0,0,1,0,0, 1])  # 1 screen
+        _send_kbd(dev36, [0xAA, 0xE3, 0, 0, 0, 1, 0, 0, 1])  # 1 screen
         dev36.close()
-        
+        dev36 = None
+
         # Prepare and screen prep on LCD
-        send65(dev, [0xAA, 0x1B, 0,0,0,0x38])
-        send65(dev, [0xAA, 0xE3, 0,0,0,1,0,0,1])
-        send65(dev, [0xAA, 0x14, 0,0,0,0x38])
-        
+        writer.send65([0xAA, 0x1B, 0, 0, 0, 0x38])
+        writer.send65([0xAA, 0xE3, 0, 0, 0, 1, 0, 0, 1])
+        writer.send65([0xAA, 0x14, 0, 0, 0, 0x38])
+
+        # --------------------------------------------------------------
         # Transfer setup (matching web tool exactly)
+        # --------------------------------------------------------------
         muted("  Setting up transfer...")
         erase_count = (file_size + 65535) // 65536 + 1
-        setup = [0xAA, 0x15, 0,0, 0,0x38, 0,0,
-                 0, 1, erase_count, 0, 0,
-                 file_size & 0xFF, (file_size >> 8) & 0xFF, (file_size >> 16) & 0xFF]
-        send65(dev, setup)
-        send65(dev, [0xAA, 0x15, 0x38,0, 0,0x38])
-        send65(dev, [0xAA, 0x15, 0x70,0, 0,0x10])
-        send65(dev, [0xAA, 0x16, 0,0,0,0x38])
-        send65(dev, [0xAA, 0x18, 0,0,0,1,0,0, erase_count])
-        muted(f"  Erasing {erase_count} blocks ({format_bytes(file_size)})...")
-        time.sleep(0.5 * erase_count)  # Wait for flash erase (500ms per 64KB block)
-        
+        setup = [
+            0xAA, 0x15, 0, 0, 0, 0x38, 0, 0,
+            0, 1, erase_count, 0, 0,
+            file_size & 0xFF,
+            (file_size >> 8) & 0xFF,
+            (file_size >> 16) & 0xFF,
+        ]
+        writer.send65(setup)
+        writer.send65([0xAA, 0x15, 0x38, 0, 0, 0x38])
+        writer.send65([0xAA, 0x15, 0x70, 0, 0, 0x10])
+        writer.send65([0xAA, 0x16, 0, 0, 0, 0x38])
+        writer.send65([0xAA, 0x18, 0, 0, 0, 1, 0, 0, erase_count])
+
+        # --------------------------------------------------------------
+        # Wait for flash erase: poll the device instead of a fixed sleep
+        # --------------------------------------------------------------
+        muted(
+            f"  Erasing {erase_count} blocks "
+            f"({format_bytes(file_size)})..."
+        )
+        erase_deadline = time.time() + max(2.0, 1.0 * erase_count)
+        device_ready = False
+        while time.time() < erase_deadline:
+            time.sleep(0.3)
+            try:
+                ok, resp = writer.send65(
+                    [0xAA, 0x1C], write_timeout_s=1.0
+                )
+                if ok and resp:
+                    device_ready = True
+                    break
+            except TimeoutError:
+                continue
+        if not device_ready:
+            time.sleep(1.0)
+
+        # --------------------------------------------------------------
         # Data transfer with write-then-read flow control
+        # Uses _send65_retry to recover from transient hangs.
+        # --------------------------------------------------------------
         CHUNK_SIZE = 56
         offset = 0
         packets_sent = 0
         total_packets = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
         start_time = time.time()
-        
+
         while offset < file_size:
             chunk = data[offset:offset + CHUNK_SIZE]
             chunk_len = len(chunk)
             if chunk_len < CHUNK_SIZE:
                 chunk = chunk + bytes(CHUNK_SIZE - chunk_len)
-            
-            pkt = [0xAA, 0x19,
-                   offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
-                   chunk_len, 0, 0] + list(chunk)
-            send65(dev, pkt)
-            
+
+            pkt = [
+                0xAA, 0x19,
+                offset & 0xFF,
+                (offset >> 8) & 0xFF,
+                (offset >> 16) & 0xFF,
+                chunk_len, 0, 0,
+            ] + list(chunk)
+            _send65_retry(writer, pkt)
+
             offset += CHUNK_SIZE
             packets_sent += 1
-            
+
             if packets_sent % 200 == 0 or packets_sent == total_packets:
                 elapsed = time.time() - start_time
                 rate = packets_sent / elapsed if elapsed > 0 else 0
                 percent = (packets_sent / total_packets) * 100
-                console.print(f"  [info]📦[/info] {packets_sent}/{total_packets} ({percent:.0f}%) [{rate:.0f} pkt/s]", end='\r')
-        
-        console.print()  # Clear line
-        
-        # Finalize (matching web tool exactly: End → syncTime → Start)
+                console.print(
+                    f"  [info]📦[/info] {packets_sent}/{total_packets} "
+                    f"({percent:.0f}%) [{rate:.0f} pkt/s]",
+                    end="\r",
+                )
+
+        console.print()  # clear progress line
+
+        # --------------------------------------------------------------
+        # Finalize (matching web tool: End → syncTime → Start)
+        # --------------------------------------------------------------
         muted("  Finalizing...")
-        send65(dev, [0xAA, 0x1A])  # End (clean, no extra bytes)
+        writer.send65([0xAA, 0x1A])  # End (clean, no extra bytes)
         # syncTime: Query → Time config → Start (matching web tool)
-        import datetime
-        send65(dev, [0xAA, 0x10])  # Query
-        sync = [0xAA, 0x17, 0,0,0,0x38,0,0]
+        writer.send65([0xAA, 0x10])  # Query
+
         now = datetime.datetime.now()
         yr = now.year
+        sync = [0xAA, 0x17, 0, 0, 0, 0x38, 0, 0]
         sync.extend([
-            (yr // 1000) % 10, (yr // 100) % 10, (yr // 10) % 10, yr % 10,
-            ((now.month) // 10) % 10, (now.month) % 10,
+            (yr // 1000) % 10, (yr // 100) % 10,
+            (yr // 10) % 10, yr % 10,
+            (now.month // 10) % 10, now.month % 10,
             now.weekday() % 7,
             (now.day // 10) % 10, now.day % 10,
             (now.hour // 10) % 10, now.hour % 10,
             (now.minute // 10) % 10, now.minute % 10,
-            (now.second // 10) % 10, now.second % 10
+            (now.second // 10) % 10, now.second % 10,
         ])
-        send65(dev, sync)
-        send65(dev, [0xAA, 0x11])  # Start
-        
+        writer.send65(sync)
+        writer.send65([0xAA, 0x11])  # Start
+
         return True
-        
+
+    except (KeyboardInterrupt, SystemExit):
+        warning("  Interrupted — attempting to reset display...")
+        if writer is not None:
+            try:
+                writer.send65([0xAA, 0x1A], write_timeout_s=1.0)
+                writer.send65([0xAA, 0x11], write_timeout_s=1.0)
+            except Exception:
+                pass
+        raise
+
     finally:
-        dev.close()
+        if writer is not None:
+            writer.kill()
+        if dev36 is not None:
+            try:
+                dev36.close()
+            except Exception:
+                pass
 
 
 @click.group()
@@ -815,6 +1086,29 @@ def convert(gif_path: Path, output_path: Path):
     console.print()
     success(f"Saved RGB565 data to: {output_path}")
     muted(f"  Total size: {format_bytes(gif.total_size)}")
+
+
+@main.command(name='reset')
+def reset_cmd():
+    """Reset the RT82 display (recover from a stuck upload).
+
+    Kills any stuck upload process, sends reset commands to the LCD,
+    and re-initializes the keyboard device -- no unplug needed.
+    """
+    print_banner()
+    console.print()
+
+    print_header("Resetting Display", "🔄")
+
+    try:
+        reset_display()
+        console.print()
+        success("Display reset complete")
+    except Exception as e:
+        console.print()
+        error(f"Reset failed: {e}")
+        muted("  You may need to unplug and replug the keyboard.")
+        raise click.Abort()
 
 
 # Alias for 'info' command
