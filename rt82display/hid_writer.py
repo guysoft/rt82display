@@ -18,7 +18,6 @@ pipes so the caller can proceed.
 import os
 import pickle
 import select
-import signal
 import struct
 import subprocess
 import sys
@@ -111,8 +110,6 @@ class HIDWriter:
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            # Detach from parent's stderr so child errors don't pollute
-            # the parent's output; send to devnull instead.
             stderr=subprocess.DEVNULL,
         )
         self._stdout_fd = self.proc.stdout.fileno()

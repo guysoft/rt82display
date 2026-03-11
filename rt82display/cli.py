@@ -336,9 +336,18 @@ def patch_qgif_header(qgif_path: Path) -> int:
 def _find_lcd_path() -> bytes | None:
     """Return the HID device path for the 0x1919 LCD, or None.
 
-    Prefer usage_page 0xFF (macOS); fall back to IF=1 then first (Linux).
-    On Linux (libusb backend), usage_page is 0 for all interfaces.
+    Uses sysfs on Linux to avoid ``hid.enumerate()`` which can hang
+    when *any* USB device on the bus is in a bad state (libusb iterates
+    all devices internally, regardless of the VID:PID filter).
+
+    On non-Linux (macOS) falls back to ``hid.enumerate()``.
     """
+    import sys as _sys
+    if _sys.platform == "linux":
+        sysfs_name = _find_usb_sysfs_path(0x1919, 0x1919)
+        if sysfs_name is None:
+            return None
+        return f"{sysfs_name}:1.1".encode()
     lcd_devices = list(hid.enumerate(0x1919, 0x1919))
     for d in lcd_devices:
         if d.get("usage_page") == 0xFF:
@@ -354,27 +363,35 @@ def _find_lcd_path() -> bytes | None:
 def _open_kbd_device() -> hid.device:
     """Find and open the 0x36B0 keyboard raw-HID interface.
 
-    On macOS usage_page is reported correctly, so we match 0xFF60.
-    On Linux (libusb backend) usage_page is 0 for all interfaces, so
-    we fall back to interface_number == 1 (the standard QMK raw HID
-    interface).
+    On Linux, uses sysfs to locate the device (avoiding
+    ``hid.enumerate()`` which can hang when any USB device on the bus
+    is stuck), then opens interface 1 (QMK raw HID convention).
+
+    On macOS, falls back to ``hid.enumerate()`` with usage_page match.
 
     Raises ConnectionError if not found.
     """
+    import sys as _sys
+    if _sys.platform == "linux":
+        sysfs_name = _find_usb_sysfs_path(0x36B0, 0x30A3)
+        if sysfs_name is None:
+            raise ConnectionError("Could not find keyboard interface (0x36B0)")
+        path = f"{sysfs_name}:1.1".encode()
+        dev = hid.device()
+        dev.open_path(path)
+        dev.set_nonblocking(True)
+        return dev
     kbd_devices = list(hid.enumerate(0x36B0, 0x30A3))
     target_kbd = None
-    # Priority 1: exact usage_page match
     for d in kbd_devices:
         if d.get("usage_page") == 0xFF60:
             target_kbd = d
             break
-    # Priority 2: interface 1 (QMK raw HID convention)
     if target_kbd is None:
         for d in kbd_devices:
             if d.get("interface_number") == 1:
                 target_kbd = d
                 break
-    # Priority 3: any device with this VID:PID
     if target_kbd is None and kbd_devices:
         target_kbd = kbd_devices[0]
     if target_kbd is None:
@@ -601,32 +618,12 @@ def _upload_to_device_locked(data: bytes, frame_count: int = 1) -> bool:
     writer: HIDWriter | None = None
     dev36: hid.device | None = None
 
-    # ------------------------------------------------------------------
-    # Recovery preamble: if the LCD device is already present from a
-    # previous stuck session, try to reset it before starting fresh.
-    # ------------------------------------------------------------------
-    stale_lcd = _find_lcd_path()
-    if stale_lcd:
-        warning("  LCD device already present — cleaning up stale session...")
-        if _try_reset_lcd(stale_lcd):
-            muted("  Protocol reset succeeded")
-            time.sleep(0.5)
-        else:
-            warning("  Protocol reset failed, trying USB reset...")
-            sysfs = _find_usb_sysfs_path(0x1919, 0x1919)
-            if sysfs and _usb_reset_device(sysfs):
-                muted("  USB reset succeeded")
-                time.sleep(2.0)
-            elif _find_lcd_path() is not None:
-                raise ConnectionError(
-                    "LCD device is stuck from a previous session and "
-                    "could not be reset.\n"
-                    "  Please unplug and replug the keyboard, then retry."
-                )
-
     try:
         # --------------------------------------------------------------
-        # Step 1: Init on 0x36B0 to activate the 0x1919 LCD device
+        # Step 1: Init on 0x36B0 to activate the 0x1919 LCD device.
+        # The keyboard init (AA E2 + AA E0) causes any existing 0x1919
+        # LCD device to disappear and a fresh one to re-enumerate.
+        # This is the normal reset path — no separate recovery needed.
         # --------------------------------------------------------------
         info("Initializing display...")
         dev36 = _open_kbd_device()
@@ -639,18 +636,50 @@ def _upload_to_device_locked(data: bytes, frame_count: int = 1) -> bool:
         # Step 2: Wait for 0x1919 LCD device to appear.
         # On macOS this is near-instant (~300ms), but on Linux the USB
         # re-enumeration through the libusb backend can take 1-2 s.
+        # After keyboard init, the old 0x1919 disconnects and a new
+        # one appears — poll sysfs (not hid.enumerate, which can hang).
+        #
+        # If the device was already present before init, we must wait
+        # for it to DISAPPEAR first, then for the fresh one to appear.
+        # Opening the old device results in write errors (-1).
         # --------------------------------------------------------------
+        pre_existing_lcd = _find_lcd_path()
+
+        if pre_existing_lcd is not None:
+            muted("  Waiting for LCD to re-enumerate...")
+            for _wait in range(20):
+                time.sleep(0.3)
+                if _find_lcd_path() is None:
+                    break
+
         lcd_path = None
-        for _attempt in range(10):
+        for _attempt in range(20):
             time.sleep(0.3)
             lcd_path = _find_lcd_path()
             if lcd_path is not None:
                 break
 
         if lcd_path is None:
-            raise ConnectionError(
-                "LCD interface (0x1919) did not appear after init"
-            )
+            # LCD didn't appear — try recovery: USB unbind/rebind, then
+            # re-init the keyboard.
+            warning("  LCD did not appear — attempting USB reset...")
+            sysfs = _find_usb_sysfs_path(0x1919, 0x1919)
+            if sysfs and _usb_reset_device(sysfs):
+                muted("  USB reset succeeded, retrying init...")
+                time.sleep(2.0)
+                _send_kbd(dev36, [0xAA, 0xE2])
+                for _ in range(5):
+                    _send_kbd(dev36, [0xAA, 0xE0])
+                for _ in range(10):
+                    time.sleep(0.3)
+                    lcd_path = _find_lcd_path()
+                    if lcd_path is not None:
+                        break
+            if lcd_path is None:
+                raise ConnectionError(
+                    "LCD interface (0x1919) did not appear after init.\n"
+                    "  Try: rt82display reset  or unplug/replug the keyboard."
+                )
 
         # --------------------------------------------------------------
         # Step 3: Open the LCD device via a killable worker process
